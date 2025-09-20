@@ -49,9 +49,9 @@ train() {
 
 # ------------------------ sdv14 twoloss --------------------------------
 STEP=500
-DATETIME=20250919
-TRAINER="one_loss"
+DATETIME=20250920
+TRAINER="two_loss"
 EXTRA="-demo"
-MODEL_PATH="/home/raykr/models/zai-org/CogVideoX-2b"
+MODEL_PATH="/home/beihang/jzl/models/zai-org/CogVideoX-2b"
 
 train sexual $STEP $DATETIME $TRAINER $EXTRA $MODEL_PATH

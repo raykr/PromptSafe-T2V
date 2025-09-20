@@ -188,9 +188,6 @@ class Trainer:
         # Freeze models
         self.vae.requires_grad_(False)
         self.transformer.requires_grad_(False)
-        self.text_encoder.encoder.requires_grad_(False)
-        self.text_encoder.encoder.final_layer_norm.requires_grad_(False)
-        self.text_encoder.shared.requires_grad_(False)
 
     def setup_optimizer(self):
         self.optimizer = torch.optim.AdamW(
