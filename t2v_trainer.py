@@ -275,7 +275,8 @@ class Trainer:
 
     def collate_fn(self, samples: List[Dict[str, Any]]) -> Dict[str, Any]:
         ret = {
-            "encoded_videos": [],
+            "malicious_encoded_videos": [],
+            "safe_encoded_videos": [],
             "prompt": [],
             "rewritten_prompt": [],
             "pseudo_prompt": [],
@@ -283,21 +284,15 @@ class Trainer:
         }
 
         for sample in samples:
-            ret["encoded_videos"].append(sample["encoded_video"])  # [C, F, H, W]
+            ret["malicious_encoded_videos"].append(sample["malicious_encoded_video"])  # [C, F, H, W]
+            ret["safe_encoded_videos"].append(sample["safe_encoded_video"])  # [C, F, H, W]
             ret["prompt"].append(sample["prompt"])  # [L, D]
             ret["rewritten_prompt"].append(sample["rewritten_prompt"])  # [L, D]
             ret["pseudo_prompt"].append(sample["pseudo_prompt"])  # [L, D]
             ret["pseudo_rewritten"].append(sample["pseudo_rewritten"])  # [L, D]
 
-        ret["encoded_videos"] = torch.stack(ret["encoded_videos"])  # [B, C, F, H, W]
-        # 将 [L, D] -> [B, L, D]
-        # for key in [
-        #     "prompt",
-        #     "rewritten_prompt",
-        #     "pseudo_prompt",
-        #     "pseudo_rewritten",
-        # ]:
-        #     ret[key] = torch.stack(ret[key])
+        ret["malicious_encoded_videos"] = torch.stack(ret["malicious_encoded_videos"])  # [B, C, F, H, W]
+        ret["safe_encoded_videos"] = torch.stack(ret["safe_encoded_videos"])  # [B, C, F, H, W]
 
         return ret
 
@@ -538,77 +533,15 @@ class Trainer:
 
         return freqs_cos, freqs_sin
     
-    
-class ThreeLossTrainer(Trainer):
-    def __init__(self, args):
-        super().__init__(args)
-
-    def training_step(self, batch):
-        # 提取 prompt pair
-        toxic_prompt = batch["prompt"]
-        safe_prompt = batch["rewritten_prompt"]
-        pseudo_toxic = batch["pseudo_prompt"]
-        pseudo_benign = batch["pseudo_rewritten"]
-
-        z_t, timesteps = self.init_latent(len(toxic_prompt))
-
-        # 预测噪声
-        noise_pred_toxic, _ = self.predict_noise(toxic_prompt, z_t, timesteps)
-        noise_pred_rewritten, _ = self.predict_noise(safe_prompt, z_t, timesteps)
-        noise_pred_pseudo, _ = self.predict_noise(pseudo_toxic, z_t, timesteps)
-        noise_pred_benign, _ = self.predict_noise(pseudo_benign, z_t, timesteps)
-
-        dist_ps_rw = F.mse_loss(noise_pred_pseudo, noise_pred_rewritten, reduction='none').mean(dim=(1,2,3)).mean()
-        dist_ps_pt = F.mse_loss(noise_pred_pseudo, noise_pred_toxic, reduction='none').mean(dim=(1,2,3)).mean()
-        dist_rw_or = F.mse_loss(noise_pred_rewritten, noise_pred_toxic, reduction='none').mean(dim=(1,2,3)).mean()
-        dist_bn_rw = F.mse_loss(noise_pred_benign, noise_pred_rewritten, reduction='none').mean(dim=(1,2,3)).mean()
-        margin = self.args.margin_coef * dist_rw_or.detach()  # detach 是为了不反传梯度
-
-        # 计算 triplet loss
-        triplet_loss = F.relu(dist_ps_rw - dist_ps_pt + margin).mean() * 10 # 拉平数量级
-        align_loss = dist_ps_rw
-        benign_loss = dist_bn_rw
-
-        loss = self.args.lambda_align * align_loss + self.args.lambda_triplet * triplet_loss + self.args.lambda_benign * benign_loss
-
-        # 记录日志
-        self.accelerator.log({
-            "loss/total": loss.detach().cpu().item(),
-            "loss/align": align_loss.detach().cpu().item(),
-            "loss/triplet": triplet_loss.detach().cpu().item(),
-            "loss/benign": benign_loss.detach().cpu().item(),
-            "dist/pseudo_rewritten": dist_ps_rw.detach().cpu().item(),
-            "dist/pseudo_toxic": dist_ps_pt.detach().cpu().item(),
-            "dist/rewritten_origin": dist_rw_or.detach().cpu().item(),
-            "dist/benign_rewritten": dist_bn_rw.detach().cpu().item(),
-            "train/margin": margin,
-            "train/learning_rate": self.args.learning_rate,
-        }, step=self.global_step)
-
-        # Record loss info
-        self.loss_list.append({
-            "loss": loss.detach().cpu().item(),
-            "step": self.global_step
-        })
-
-        return loss
 
 class TwoLossTrainer(Trainer):
     def __init__(self, args):
         super().__init__(args)
 
-    def training_step(self, batch):
-        # 提取 prompt pair
-        toxic_prompt = batch["prompt"]
-        safe_prompt = batch["rewritten_prompt"]
-        pseudo_toxic = batch["pseudo_prompt"]
-        pseudo_benign = batch["pseudo_rewritten"]
-        latent = batch["encoded_videos"]
 
-
+    def reshape_latent(self, latent):
         # Shape of prompt_embedding: [B, seq_len, hidden_size]
         # Shape of latent: [B, C, F, H, W]
-
         patch_size_t = self.transformer.config.patch_size_t
         if patch_size_t is not None:
             ncopy = latent.shape[2] % patch_size_t
@@ -617,7 +550,19 @@ class TwoLossTrainer(Trainer):
             latent = torch.cat([first_frame.repeat(1, 1, ncopy, 1, 1), latent], dim=2)
             assert latent.shape[2] % patch_size_t == 0
 
-        batch_size, num_channels, num_frames, height, width = latent.shape
+    def training_step(self, batch):
+        # 提取 prompt pair
+        toxic_prompt = batch["prompt"]
+        safe_prompt = batch["rewritten_prompt"]
+        pseudo_toxic = batch["pseudo_prompt"]
+        pseudo_benign = batch["pseudo_rewritten"]
+        malicious_latent = batch["malicious_encoded_videos"]
+        safe_latent = batch["safe_encoded_videos"]
+
+        malicious_latent = self.reshape_latent(malicious_latent)
+        safe_latent = self.reshape_latent(safe_latent)
+
+        batch_size, num_channels, num_frames, height, width = malicious_latent.shape
 
         # Get prompt embeddings
         toxic_prompt_embedding = self.encode_text(toxic_prompt)
@@ -635,9 +580,13 @@ class TwoLossTrainer(Trainer):
         timesteps = timesteps.long()
 
         # Add noise to latent
-        latent = latent.permute(0, 2, 1, 3, 4)  # from [B, C, F, H, W] to [B, F, C, H, W]
-        noise = torch.randn_like(latent)
-        latent_added_noise = self.noise_scheduler.add_noise(latent, noise, timesteps)
+        malicious_latent = malicious_latent.permute(0, 2, 1, 3, 4)  # from [B, C, F, H, W] to [B, F, C, H, W]
+        noise = torch.randn_like(malicious_latent)
+        malicious_latent_added_noise = self.noise_scheduler.add_noise(malicious_latent, noise, timesteps)
+
+        safe_latent = safe_latent.permute(0, 2, 1, 3, 4)  # from [B, C, F, H, W] to [B, F, C, H, W]
+        noise = torch.randn_like(safe_latent)
+        safe_latent_added_noise = self.noise_scheduler.add_noise(safe_latent, noise, timesteps)
 
 
         # Prepare rotary embeds
@@ -658,7 +607,7 @@ class TwoLossTrainer(Trainer):
 
         # Predict noise
         noise_pred_toxic = self.transformer(
-            hidden_states=latent_added_noise,
+            hidden_states=malicious_latent_added_noise,
             encoder_hidden_states=toxic_prompt_embedding,
             timestep=timesteps,
             image_rotary_emb=rotary_emb,
@@ -666,7 +615,7 @@ class TwoLossTrainer(Trainer):
         )[0]
 
         noise_pred_rewritten = self.transformer(
-            hidden_states=latent_added_noise,
+            hidden_states=safe_latent_added_noise,
             encoder_hidden_states=safe_prompt_embedding,
             timestep=timesteps,
             image_rotary_emb=rotary_emb,
@@ -674,7 +623,7 @@ class TwoLossTrainer(Trainer):
         )[0]
 
         noise_pred_pseudo = self.transformer(
-            hidden_states=latent_added_noise,
+            hidden_states=malicious_latent_added_noise,
             encoder_hidden_states=pseudo_prompt_embedding,
             timestep=timesteps,
             image_rotary_emb=rotary_emb,
@@ -682,7 +631,7 @@ class TwoLossTrainer(Trainer):
         )[0]    
 
         noise_pred_benign = self.transformer(
-            hidden_states=latent_added_noise,
+            hidden_states=safe_latent_added_noise,
             encoder_hidden_states=pseudo_benign_embedding,
             timestep=timesteps,
             image_rotary_emb=rotary_emb,
@@ -690,10 +639,10 @@ class TwoLossTrainer(Trainer):
         )[0]
 
         # Compute losses
-        dist_ps_rw = F.mse_loss(noise_pred_pseudo, noise_pred_rewritten, reduction='none').mean(dim=(1,2,3)).mean()
-        dist_ps_pt = F.mse_loss(noise_pred_pseudo, noise_pred_toxic, reduction='none').mean(dim=(1,2,3)).mean()
-        dist_rw_or = F.mse_loss(noise_pred_rewritten, noise_pred_toxic, reduction='none').mean(dim=(1,2,3)).mean()
-        dist_bn_rw = F.mse_loss(noise_pred_benign, noise_pred_rewritten, reduction='none').mean(dim=(1,2,3)).mean()
+        dist_ps_rw = F.mse_loss(noise_pred_pseudo, noise_pred_rewritten, reduction='mean')
+        dist_ps_pt = F.mse_loss(noise_pred_pseudo, noise_pred_toxic, reduction='mean')
+        dist_rw_or = F.mse_loss(noise_pred_rewritten, noise_pred_toxic, reduction='mean')
+        dist_bn_rw = F.mse_loss(noise_pred_benign, noise_pred_rewritten, reduction='mean')
         margin = self.args.margin_coef * dist_rw_or.detach()  # detach 是为了不反传梯度
 
         # 计算 triplet loss
@@ -727,16 +676,10 @@ class OneLossTrainer(Trainer):
     def __init__(self, args):
         super().__init__(args)
 
-    def training_step(self, batch):
-        # 提取 prompt pair
-        safe_prompt = batch["rewritten_prompt"]
-        pseudo_toxic = batch["pseudo_prompt"]
-        latent = batch["encoded_videos"]
 
-
+    def reshape_latent(self, latent):
         # Shape of prompt_embedding: [B, seq_len, hidden_size]
         # Shape of latent: [B, C, F, H, W]
-
         patch_size_t = self.transformer.config.patch_size_t
         if patch_size_t is not None:
             ncopy = latent.shape[2] % patch_size_t
@@ -745,7 +688,17 @@ class OneLossTrainer(Trainer):
             latent = torch.cat([first_frame.repeat(1, 1, ncopy, 1, 1), latent], dim=2)
             assert latent.shape[2] % patch_size_t == 0
 
-        batch_size, num_channels, num_frames, height, width = latent.shape
+    def training_step(self, batch):
+        # 提取 prompt pair
+        safe_prompt = batch["rewritten_prompt"]
+        pseudo_toxic = batch["pseudo_prompt"]
+        malicious_latent = batch["malicious_encoded_videos"]
+        safe_latent = batch["safe_encoded_videos"]
+
+        self.reshape_latent(malicious_latent)
+        self.reshape_latent(safe_latent)
+
+        batch_size, num_channels, num_frames, height, width = malicious_latent.shape
 
         # Get prompt embeddings
         safe_prompt_embedding = self.encode_text(safe_prompt)
@@ -761,9 +714,13 @@ class OneLossTrainer(Trainer):
         timesteps = timesteps.long()
 
         # Add noise to latent
-        latent = latent.permute(0, 2, 1, 3, 4)  # from [B, C, F, H, W] to [B, F, C, H, W]
-        noise = torch.randn_like(latent)
-        latent_added_noise = self.noise_scheduler.add_noise(latent, noise, timesteps)
+        malicious_latent = malicious_latent.permute(0, 2, 1, 3, 4)  # from [B, C, F, H, W] to [B, F, C, H, W]
+        noise = torch.randn_like(malicious_latent)
+        malicious_latent_added_noise = self.noise_scheduler.add_noise(malicious_latent, noise, timesteps)
+
+        safe_latent = safe_latent.permute(0, 2, 1, 3, 4)  # from [B, C, F, H, W] to [B, F, C, H, W]
+        noise = torch.randn_like(safe_latent)
+        safe_latent_added_noise = self.noise_scheduler.add_noise(safe_latent, noise, timesteps)
 
 
         # Prepare rotary embeds
@@ -784,7 +741,7 @@ class OneLossTrainer(Trainer):
 
         # Predict noise
         noise_pred_rewritten = self.transformer(
-            hidden_states=latent_added_noise,
+            hidden_states=safe_latent_added_noise,
             encoder_hidden_states=safe_prompt_embedding,
             timestep=timesteps,
             image_rotary_emb=rotary_emb,
@@ -792,7 +749,7 @@ class OneLossTrainer(Trainer):
         )[0]
 
         noise_pred_pseudo = self.transformer(
-            hidden_states=latent_added_noise,
+            hidden_states=malicious_latent_added_noise,
             encoder_hidden_states=pseudo_prompt_embedding,
             timestep=timesteps,
             image_rotary_emb=rotary_emb,
@@ -800,14 +757,12 @@ class OneLossTrainer(Trainer):
         )[0]    
 
         # Compute losses
-        dist_ps_rw = F.mse_loss(noise_pred_pseudo, noise_pred_rewritten, reduction='none').mean(dim=(1,2,3)).mean()
-
+        dist_ps_rw = F.mse_loss(noise_pred_pseudo, noise_pred_rewritten, reduction='mean')
         loss = dist_ps_rw
 
         # 记录日志
         self.accelerator.log({
             "loss/total": loss.detach().cpu().item(),
-            "dist/pseudo_rewritten": dist_ps_rw.detach().cpu().item(),
             "train/learning_rate": self.args.learning_rate,
         }, step=self.global_step)
 
@@ -818,4 +773,3 @@ class OneLossTrainer(Trainer):
         })
 
         return loss
-    

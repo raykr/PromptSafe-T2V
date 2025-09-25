@@ -35,7 +35,8 @@ class T2VInferencePipeline:
         self,
         pretrained_model_path: str,
         learned_embeds_path: str,
-        config_path: str,
+        placeholder_token: str,
+        num_vectors: int,
         device: str = "cuda",
         dtype: torch.dtype = torch.float16
     ):
@@ -45,22 +46,18 @@ class T2VInferencePipeline:
         Args:
             pretrained_model_path: 预训练模型路径
             learned_embeds_path: 学习到的embedding参数路径
-            config_path: 训练配置文件路径
             device: 设备
             dtype: 数据类型
         """
         self.device = device
         self.dtype = dtype
         
-        # 加载训练配置
-        with open(config_path, 'r') as f:
-            self.config = json.load(f)
         
         # 加载模型组件
         self._load_models(pretrained_model_path)
         
         # 加载soft token embedding
-        self._load_soft_token_embeddings(learned_embeds_path)
+        self._load_soft_token_embeddings(learned_embeds_path, placeholder_token, num_vectors)
         
         # 创建pipeline
         self._create_pipeline()
@@ -106,7 +103,7 @@ class T2VInferencePipeline:
         
         print("模型组件加载完成")
     
-    def _load_soft_token_embeddings(self, learned_embeds_path: str):
+    def _load_soft_token_embeddings(self, learned_embeds_path: str, placeholder_token: str, num_vectors: int):
         """加载soft token embedding参数"""
         print(f"正在加载soft token embedding参数: {learned_embeds_path}")
         
@@ -117,8 +114,8 @@ class T2VInferencePipeline:
             learned_embeds_dict = torch.load(learned_embeds_path, map_location='cpu')
         
         # 获取placeholder token
-        self.placeholder_token = self.config['placeholder_token']
-        self.num_vectors = self.config['num_vectors']
+        self.placeholder_token = placeholder_token
+        self.num_vectors = num_vectors
         
         # 添加placeholder tokens到tokenizer
         placeholder_tokens = [self.placeholder_token]
@@ -368,14 +365,19 @@ def main():
     parser.add_argument(
         "--learned_embeds_path",
         type=str,
-        required=True,
         help="学习到的embedding参数路径"
     )
     parser.add_argument(
-        "--config_path",
+        "--placeholder_token",
         type=str,
-        required=True,
-        help="训练配置文件路径"
+        default="<safe>",
+        help="placeholder token"
+    )
+    parser.add_argument(
+        "--num_vectors",
+        type=int,
+        default=1,
+        help="num vectors"
     )
     parser.add_argument(
         "--prompt",
@@ -461,7 +463,8 @@ def main():
     pipeline = T2VInferencePipeline(
         pretrained_model_path=args.pretrained_model_path,
         learned_embeds_path=args.learned_embeds_path,
-        config_path=args.config_path,
+        placeholder_token=args.placeholder_token,
+        num_vectors=args.num_vectors,
         device=args.device
     )
     

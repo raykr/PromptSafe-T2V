@@ -9,8 +9,7 @@ train() {
   local EXTRA=$5
   local MODEL_PATH=$6
 
-  DATASET_NAME="train_${TYPE}_toxic"
-  OUR_DIR="./out/$DATASET_NAME-$DATETIME-$TRAINER$EXTRA"
+  OUR_DIR="./out/$DATETIME-$TRAINER$EXTRA"
   CUDA_DEVICE=0
 
   CUDA_VISIBLE_DEVICES="$CUDA_DEVICE" accelerate launch \
@@ -48,10 +47,10 @@ train() {
 }
 
 # ------------------------ sdv14 twoloss --------------------------------
-STEP=500
-DATETIME=20250920
-TRAINER="two_loss"
-EXTRA="-demo"
+STEP=1000
+DATETIME=20250921
+TRAINER="one_loss"
+EXTRA="-red"
 MODEL_PATH="/home/beihang/jzl/models/zai-org/CogVideoX-2b"
 
-train sexual $STEP $DATETIME $TRAINER $EXTRA $MODEL_PATH
+train safe $STEP $DATETIME $TRAINER $EXTRA $MODEL_PATH

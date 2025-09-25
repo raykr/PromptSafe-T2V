@@ -114,13 +114,29 @@ def log_validation(text_encoder, tokenizer, unet, vae, args, accelerator, weight
 
 
 def save_progress(text_encoder, placeholder_token_ids, accelerator, args, save_path, safe_serialization=True):
-    logger.info("Saving embeddings")
-    learned_embeds = (
-        accelerator.unwrap_model(text_encoder)
-        .get_input_embeddings()
-        .weight[min(placeholder_token_ids) : max(placeholder_token_ids) + 1]
-    )
-    learned_embeds_dict = {args.placeholder_token: learned_embeds.detach().cpu()}
+    logger.info(f"Saving embeddings: {placeholder_token_ids}")
+    
+    # 获取text encoder的embedding层
+    embedding_layer = accelerator.unwrap_model(text_encoder).get_input_embeddings()
+    
+    # 提取所有placeholder token的embedding
+    learned_embeds = []
+    for token_id in sorted(placeholder_token_ids):
+        if token_id < embedding_layer.weight.shape[0]:
+            learned_embeds.append(embedding_layer.weight[token_id].detach().cpu())
+        else:
+            logger.warning(f"Token ID {token_id} 超出embedding层范围!")
+    
+    if not learned_embeds:
+        raise ValueError("没有有效的placeholder token embedding!")
+    
+    # 堆叠成tensor
+    learned_embeds = torch.stack(learned_embeds)
+    learned_embeds_dict = {args.placeholder_token: learned_embeds}
+    
+    logger.info(f"保存embedding形状: {learned_embeds.shape}")
+    logger.info(f"保存embedding均值: {learned_embeds.mean().item():.6f}")
+    logger.info(f"保存embedding标准差: {learned_embeds.std().item():.6f}")
 
     if safe_serialization:
         safetensors.torch.save_file(learned_embeds_dict, save_path, metadata={"format": "pt"})

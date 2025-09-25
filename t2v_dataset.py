@@ -75,7 +75,8 @@ class T2VContrastDatasetWithResize:
         row = self.df.iloc[index]
         prompt = str(row["prompt"])
         rewritten_prompt = str(row["rewritten_prompt"])
-        video_path = str(row["video_path"])
+        malicious_video_path = str(row["malicious_video_path"])
+        safe_video_path = str(row["safe_video_path"])
 
         if self.position == "start":
             pseudo_prompt = f"{self.placeholder_token} {prompt}"
@@ -103,6 +104,26 @@ class T2VContrastDatasetWithResize:
         emb_benign = get_text_embedding(pseudo_rewritten)
 
         # 视频 latent 缓存
+        malicious_encoded_video = self.get_encoded_video(malicious_video_path)
+        safe_encoded_video = self.get_encoded_video(safe_video_path)
+        
+
+        return {
+            "malicious_encoded_video": malicious_encoded_video,
+            "safe_encoded_video": safe_encoded_video,
+            # embeddings (for LoRA 对齐/TwoLoss 训练路径)
+            "prompt_embedding_toxic": emb_toxic,
+            "prompt_embedding_rewritten": emb_rewritten,
+            "prompt_embedding_pseudo": emb_pseudo,
+            "prompt_embedding_benign": emb_benign,
+            # raw prompts (for 软词向量训练路径)
+            "prompt": prompt,
+            "rewritten_prompt": rewritten_prompt,
+            "pseudo_prompt": pseudo_prompt,
+            "pseudo_rewritten": pseudo_rewritten,
+        }
+
+    def get_encoded_video(self, video_path: str) -> torch.Tensor:
         encoded_video_path = self.video_latent_dir / (Path(video_path).stem + ".safetensors")
         if encoded_video_path.exists():
             encoded_video = load_file(encoded_video_path)["encoded_video"]
@@ -120,19 +141,4 @@ class T2VContrastDatasetWithResize:
             logger.debug(
                 f"Saved encoded video to {encoded_video_path}", main_process_only=False
             )
-
-        return {
-            "encoded_video": encoded_video,
-            # embeddings (for LoRA 对齐/TwoLoss 训练路径)
-            "prompt_embedding_toxic": emb_toxic,
-            "prompt_embedding_rewritten": emb_rewritten,
-            "prompt_embedding_pseudo": emb_pseudo,
-            "prompt_embedding_benign": emb_benign,
-            # raw prompts (for 软词向量训练路径)
-            "prompt": prompt,
-            "rewritten_prompt": rewritten_prompt,
-            "pseudo_prompt": pseudo_prompt,
-            "pseudo_rewritten": pseudo_rewritten,
-        }
-
-
+        return encoded_video
