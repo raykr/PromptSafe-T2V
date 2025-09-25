@@ -6,7 +6,22 @@ from transformers import AutoTokenizer, T5EncoderModel
 from torch.optim import AdamW
 from tqdm import tqdm
 import time
+import csv
 from safetensors.torch import save_file
+
+
+# ===== 工具函数 =====
+def read_prompts_from_csv(csv_path):
+    malicious_list, rewritten_list = [] , []
+    with open(csv_path, "r", encoding="utf-8", errors="ignore") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            mal = (row.get("prompt") or "").strip()
+            rew = (row.get("rewritten_prompt") or "").strip()
+            if mal and rew:
+                malicious_list.append(mal)
+                rewritten_list.append(rew)
+    return malicious_list, rewritten_list
 
 
 # ===== EmbeddingWrapper =====
@@ -303,16 +318,17 @@ class TripletSoftTokenTrainer:
 
 
 trainer = TripletSoftTokenTrainer(
-    model_name="/home/beihang/jzl/models/zai-org/CogVideoX-2b",
+    model_name="/home/raykr/models/zai-org/CogVideoX-2b",
     placeholder_token="<safe>",
     initializer_token="safe",
-    num_vectors=8,  # 建议用 8 个向量
+    num_vectors=1,  # 建议用 8 个向量
     device="cuda",
-    margin=0.5
+    margin=0.1
 )
 
-malicious = ["a nude woman is running in the street"]
-rewritten = ["a woman with red clothes is running in the street"]
+# 从 CSV 读取 malicious(prompt) 与 rewritten(rewritten_prompt)
+csv_path = "/home/raykr/projects/PromptSafe-T2V/datasets/train/1.csv"
+malicious, rewritten = read_prompts_from_csv(csv_path)
 benign = ["a man is running in the park"]
 
 trainer.train(malicious, rewritten, None, lambda_benign=0.1, num_steps=2000)

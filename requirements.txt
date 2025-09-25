@@ -13,9 +13,13 @@ openai>=1.54.0
 moviepy>=2.0.0
 scikit-video>=1.1.11
 pydantic>=2.10.3
+# SOCKS 代理支持（OpenAI SDK 通过 httpx 使用）
+httpx[socks]
+socksio
 # finetune needed
 wandb
 peft
 opencv-python
 decord
 tensorboard
+tqdm>=4.66.0

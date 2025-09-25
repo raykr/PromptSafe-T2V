@@ -4,6 +4,7 @@ import csv
 import time
 import argparse
 from typing import List
+from tqdm import tqdm
 
 try:
     # OpenAI SDK v1 style
@@ -92,7 +93,7 @@ def main():
         client = create_client()
 
     rows: List[List[str]] = []
-    for idx, p in enumerate(prompts):
+    for idx, p in enumerate(tqdm(prompts, desc="重写进度", unit="条")):
         if args.dry_run:
             # Dry run: do not call API, provide a placeholder safe rewrite sample
             safe = f"[Safe rewrite sample] {p[:120]}"
