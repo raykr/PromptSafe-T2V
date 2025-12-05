@@ -8,6 +8,7 @@ from tqdm import tqdm
 import time
 import csv
 from safetensors.torch import save_file
+import random
 
 
 # ===== 工具函数 =====
@@ -166,12 +167,13 @@ class SoftTokenTextEncoderTrainer:
 
 class TripletSoftTokenTrainer:
     def __init__(self, model_name, placeholder_token="<safe>", initializer_token="safe", 
-                 num_vectors=4, device="cuda", lr=5e-4, margin=0.1):
+                 num_vectors=4, device="cuda", lr=5e-4, margin=0.1, max_length=128):
         self.device = device
         self.num_vectors = num_vectors
         self.placeholder_token = placeholder_token
         self.initializer_token = initializer_token
         self.margin = margin
+        self.max_length = max_length
 
         # 加载 T5Encoder 和 tokenizer
         self.tokenizer = AutoTokenizer.from_pretrained(model_name, subfolder="tokenizer")
@@ -189,6 +191,26 @@ class TripletSoftTokenTrainer:
             .clone().detach().requires_grad_(True)
         )
         self.optimizer = torch.optim.AdamW([self.soft_token_embedding], lr=lr)
+        # 仅用于加速训练的编码缓存（与 soft token 无关的 positive/negative）
+        self._cache_positive = None
+        self._cache_negative = None
+        self._text_to_index_malicious = None
+        self._text_to_index_rewritten = None
+
+    def _encode_list(self, texts, batch_size=256):
+        """将一组文本分批编码为 [N, D]，不保留梯度，用于缓存。"""
+        self.text_encoder.eval()
+        outputs = []
+        with torch.no_grad():
+            for i in range(0, len(texts), batch_size):
+                batch = texts[i:i+batch_size]
+                emb = self.encode(batch)  # encode 已含 attention_mask 与 nan 防护
+                outputs.append(emb.detach())
+        if outputs:
+            cached = torch.cat(outputs, dim=0)
+        else:
+            cached = torch.empty(0, device=self.device)
+        return cached
 
     def setup_placeholder_tokens(self):
         placeholder_tokens = [self.placeholder_token]
@@ -214,31 +236,66 @@ class TripletSoftTokenTrainer:
                 token_embeds[tid] = token_embeds[self.initializer_token_id].clone()
 
     def _encode_with_soft_token(self, texts):
-        token_ids = self.tokenizer(texts, padding=True, truncation=True, return_tensors="pt").input_ids.to(self.device)
+        encoded_inputs = self.tokenizer(
+            texts,
+            padding=True,
+            truncation=True,
+            max_length=self.max_length,
+            return_tensors="pt",
+        )
+        token_ids = encoded_inputs.input_ids.to(self.device)
+        attention_mask = encoded_inputs.attention_mask.to(self.device)
 
-        embedding_matrix = self.text_encoder.get_input_embeddings().weight
-        custom_embeddings = embedding_matrix.clone()
-        custom_embeddings[self.placeholder_token_ids] = self.soft_token_embedding
+        base_embedding_layer = self.text_encoder.get_input_embeddings()
+        inputs_embeds = base_embedding_layer(token_ids)
+        for i, tid in enumerate(self.placeholder_token_ids):
+            mask = (token_ids == tid).unsqueeze(-1)
+            replacement = self.soft_token_embedding[i].unsqueeze(0).unsqueeze(0)
+            inputs_embeds = torch.where(mask, replacement, inputs_embeds)
 
-        inputs_embeds = F.embedding(token_ids, custom_embeddings)
-
-        outputs = self.text_encoder.encoder(inputs_embeds=inputs_embeds)
-        return outputs.last_hidden_state.mean(dim=1)
+        outputs = self.text_encoder.encoder(inputs_embeds=inputs_embeds, attention_mask=attention_mask)
+        encoded = outputs.last_hidden_state.mean(dim=1)
+        encoded = torch.nan_to_num(encoded)
+        return encoded
 
     def encode(self, texts):
-        token_ids = self.tokenizer(texts, padding=True, truncation=True, return_tensors="pt").input_ids.to(self.device)
-        outputs = self.text_encoder(token_ids)[0]
-        return outputs.mean(dim=1)
+        encoded_inputs = self.tokenizer(
+            texts,
+            padding=True,
+            truncation=True,
+            max_length=self.max_length,
+            return_tensors="pt",
+        )
+        input_ids = encoded_inputs.input_ids.to(self.device)
+        attention_mask = encoded_inputs.attention_mask.to(self.device)
+
+        outputs = self.text_encoder(input_ids=input_ids, attention_mask=attention_mask)[0]
+        encoded = outputs.mean(dim=1)
+        encoded = torch.nan_to_num(encoded)
+        return encoded
 
     def training_step(self, malicious, rewritten, benign=None, lambda_benign=0.1):
         # Anchor: <safe> malicious
         anchor = self._encode_with_soft_token([f"{self.placeholder_token} {t}" for t in malicious])
         # Positive: rewritten
-        positive = self.encode(rewritten)
+        if self._cache_positive is not None and self._text_to_index_rewritten is not None:
+            idx = torch.tensor([self._text_to_index_rewritten[t] for t in rewritten], device=self.device, dtype=torch.long)
+            positive = self._cache_positive.index_select(0, idx)
+        else:
+            with torch.no_grad():
+                positive = self.encode(rewritten)
         # Negative: malicious
-        negative = self.encode(malicious)
+        if self._cache_negative is not None and self._text_to_index_malicious is not None:
+            idx = torch.tensor([self._text_to_index_malicious[t] for t in malicious], device=self.device, dtype=torch.long)
+            negative = self._cache_negative.index_select(0, idx)
+        else:
+            with torch.no_grad():
+                negative = self.encode(malicious)
 
         # Triplet Loss
+        anchor = torch.nan_to_num(anchor)
+        positive = torch.nan_to_num(positive)
+        negative = torch.nan_to_num(negative)
         d_ap = F.pairwise_distance(anchor, positive)
         d_an = F.pairwise_distance(anchor, negative)
         triplet_loss = torch.relu(d_ap - d_an + self.margin).mean()
@@ -255,6 +312,11 @@ class TripletSoftTokenTrainer:
 
         self.optimizer.zero_grad()
         loss.backward()
+        # 梯度裁剪，避免梯度爆炸
+        try:
+            torch.nn.utils.clip_grad_norm_([self.soft_token_embedding], max_norm=1.0)
+        except Exception:
+            pass
         self.optimizer.step()
 
         return {
@@ -265,14 +327,29 @@ class TripletSoftTokenTrainer:
             "d_an": d_an.mean().item(),
         }
 
-    def train(self, malicious, rewritten, benign=None, lambda_benign=0.1, num_steps=1000, log_interval=50):
+    def train(self, malicious, rewritten, benign=None, lambda_benign=0.1, num_steps=1000, log_interval=50, batch_size=32):
         print(f"🚀 开始训练 Triplet Soft Token，对齐步数={num_steps}")
         best_loss = float("inf")
         pbar = tqdm(range(num_steps), desc="训练进度", unit="step")
         start_time = time.time()
 
+        # 预计算并缓存 rewritten/malicious 的编码（它们与 soft token 无关），显著减少每步计算量
+        self._text_to_index_malicious = {t: i for i, t in enumerate(malicious)}
+        self._text_to_index_rewritten = {t: i for i, t in enumerate(rewritten)}
+        if len(malicious) > 0:
+            self._cache_negative = self._encode_list(malicious, batch_size=256)
+        if len(rewritten) > 0:
+            self._cache_positive = self._encode_list(rewritten, batch_size=256)
+
         for step in pbar:
-            logs = self.training_step(malicious, rewritten, benign, lambda_benign)
+            # 随机采样一个小批次，避免一次性将全部样本放入显存
+            data_size = min(len(malicious), len(rewritten))
+            if data_size == 0:
+                raise ValueError("空数据集：请检查 CSV 的 prompt 与 rewritten_prompt 列是否为空")
+            batch_indices = random.sample(range(data_size), k=min(batch_size, data_size))
+            mal_batch = [malicious[i] for i in batch_indices]
+            rew_batch = [rewritten[i] for i in batch_indices]
+            logs = self.training_step(mal_batch, rew_batch, None, lambda_benign)
             if logs["loss"] < best_loss:
                 best_loss = logs["loss"]
 
@@ -318,7 +395,7 @@ class TripletSoftTokenTrainer:
 
 
 trainer = TripletSoftTokenTrainer(
-    model_name="/home/raykr/models/zai-org/CogVideoX-2b",
+    model_name="/home/beihang/jzl/models/zai-org/CogVideoX-2b",
     placeholder_token="<safe>",
     initializer_token="safe",
     num_vectors=1,  # 建议用 8 个向量
@@ -327,10 +404,10 @@ trainer = TripletSoftTokenTrainer(
 )
 
 # 从 CSV 读取 malicious(prompt) 与 rewritten(rewritten_prompt)
-csv_path = "/home/raykr/projects/PromptSafe-T2V/datasets/train/1.csv"
+csv_path = "datasets/train/1.csv"
 malicious, rewritten = read_prompts_from_csv(csv_path)
 benign = ["a man is running in the park"]
 
-trainer.train(malicious, rewritten, None, lambda_benign=0.1, num_steps=2000)
+trainer.train(malicious, rewritten, None, lambda_benign=0.1, num_steps=2000, batch_size=32)
 trainer.save_soft_embedding("triplet_soft.safetensors")
 

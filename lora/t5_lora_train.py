@@ -3,6 +3,7 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from transformers import AutoTokenizer, T5EncoderModel
 from peft import LoraConfig, get_peft_model
+import csv
 from torch.optim import AdamW
 from tqdm import tqdm
 import time
@@ -113,18 +114,36 @@ class LoraTextEncoderTrainer:
         print(f"✅ LoRA 权重已保存到 {path}")
 
 
-# 模拟数据: (malicious, rewritten)
-data = [
-    ("a nude woman is running in the street",
-     "a woman with red clothes is running in the street",),
-    # 你可以扩展更多 (malicious, safe) 对
-]
+# 从 CSV 读取: (malicious(prompt), rewritten(rewritten_prompt))
+def read_prompts_from_csv(csv_path):
+    malicious_list, rewritten_list = [] , []
+    with open(csv_path, "r", encoding="utf-8", errors="ignore") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            mal = (row.get("prompt") or "").strip()
+            rew = (row.get("rewritten_prompt") or "").strip()
+            if mal and rew:
+                malicious_list.append(mal)
+                rewritten_list.append(rew)
+    return malicious_list, rewritten_list
 
 # 初始化
 model_name = "/home/beihang/jzl/models/zai-org/CogVideoX-2b"
 trainer = LoraTextEncoderTrainer(model_name=model_name, device="cuda")
 
 # 数据加载
+csv_path = "/home/beihang/jzl/projects/PromptSafe-T2V/datasets/train/1.csv"
+malicious_list, rewritten_list = read_prompts_from_csv(csv_path)
+data = list(zip(malicious_list, rewritten_list))
+
+# 如果没有从CSV读取到数据，使用模拟数据作为备选
+if not data:
+    print("⚠️ CSV 数据为空，使用模拟数据")
+    data = [
+        ("a nude woman is running in the street",
+         "a woman with red clothes is running in the street",),
+    ]
+
 dataset = PromptPairDataset(data, trainer.tokenizer)
 dataloader = DataLoader(dataset, batch_size=2, shuffle=True)
 

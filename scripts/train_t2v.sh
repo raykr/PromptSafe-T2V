@@ -1,6 +1,10 @@
 # Prevent tokenizer parallelism issues
 export TOKENIZERS_PARALLELISM=false
 
+# Disable PyTorch Dynamo to avoid conflicts with gradient checkpointing
+export TORCH_COMPILE=0
+export TORCHDYNAMO_DISABLE=1
+
 train() {
   local TYPE=$1
   local STEP=$2
@@ -12,7 +16,7 @@ train() {
   OUR_DIR="./out/$DATETIME-$TRAINER$EXTRA"
   CUDA_DEVICE=0
 
-  CUDA_VISIBLE_DEVICES="$CUDA_DEVICE" accelerate launch \
+  CUDA_VISIBLE_DEVICES="$CUDA_DEVICE" python -m accelerate.commands.accelerate_cli launch \
     --num_processes=1 \
     --num_machines=1 \
     --mixed_precision=fp16 \
@@ -48,9 +52,9 @@ train() {
 
 # ------------------------ sdv14 twoloss --------------------------------
 STEP=1000
-DATETIME=20250921
-TRAINER="one_loss"
-EXTRA="-red"
+DATETIME=20251012
+TRAINER="ti"
+EXTRA="-1"
 MODEL_PATH="/home/beihang/jzl/models/zai-org/CogVideoX-2b"
 
 train safe $STEP $DATETIME $TRAINER $EXTRA $MODEL_PATH

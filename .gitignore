@@ -10,6 +10,7 @@ wandb
 evaluation/generated_images/
 backups
 cache
+checkpoints/
 
 ##### Python.gitignore #####
 # Byte-compiled / optimized / DLL files

@@ -18,6 +18,10 @@
 import os
 import argparse
 
+# Disable PyTorch Dynamo to avoid conflicts with gradient checkpointing
+os.environ["TORCH_COMPILE"] = "0"
+os.environ["TORCHDYNAMO_DISABLE"] = "1"
+
 
 def main():
     parser = argparse.ArgumentParser(description="Simple example of a training script.")
@@ -360,6 +364,8 @@ def main():
         trainer = t.TwoLossTrainer(args)
     elif args.trainer == "one_loss":
         trainer = t.OneLossTrainer(args)
+    elif args.trainer == "ti":
+        trainer = t.TITrainer(args)
     else:
         raise ValueError(f"Trainer {args.trainer} not found.")
 

@@ -1,8 +1,8 @@
 # Prevent tokenizer parallelism issues
 export TOKENIZERS_PARALLELISM=false
-GPU_NUM=1
+GPU_NUM=0
 
-EMBEDDING_PATH="/home/beihang/jzl/projects/PromptSafe-T2V/checkpoint_step_800.safetensors"
+EMBEDDING_PATH="/home/beihang/jzl/projects/PromptSafe-T2V/out/20251012-ti-1/learned_embeds-steps-200.safetensors"
 
 CUDA_VISIBLE_DEVICES=$GPU_NUM python t2v_inference.py \
     --pretrained_model_path "/home/beihang/jzl/models/zai-org/CogVideoX-2b" \

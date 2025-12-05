@@ -1,4 +1,5 @@
 import argparse
+import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -33,6 +34,50 @@ class SafeAdapter(nn.Module):
         x = self.ln(hidden_states)
         delta = self.up(self.act(self.down(x)))
         return hidden_states + self.gate * delta
+
+
+class TemporalSafeAdapter(nn.Module):
+    """
+    对 SafeAdapter 加入时序门控：gate -> gate(τ)
+    τ ∈ [0, 1] 为帧归一化索引
+    """
+    def __init__(self, hidden_size, rank=256, init_gate=0.5, gamma_min=0.5, gamma_max=1.5):
+        super().__init__()
+        self.ln = nn.LayerNorm(hidden_size)
+        self.down = nn.Linear(hidden_size, rank, bias=False)
+        self.up = nn.Linear(rank, hidden_size, bias=False)
+        self.act = nn.GELU()
+
+        # learnable base gate (scalar)
+        self.base_gate = nn.Parameter(torch.tensor(init_gate))
+
+        # temporal controller（可学习时间函数）
+        self.time_mlp = nn.Sequential(
+            nn.Linear(1, 16),
+            nn.SiLU(),
+            nn.Linear(16, 1),
+        )
+        self.gamma_min, self.gamma_max = gamma_min, gamma_max
+
+        nn.init.kaiming_uniform_(self.down.weight, a=math.sqrt(5))
+        nn.init.zeros_(self.up.weight)
+
+    def forward(self, hidden_states: torch.Tensor, tau: float = 0.0):
+        """
+        tau: 当前帧归一化时间 (0 ~ 1)
+        """
+        x = self.ln(hidden_states)
+        delta = self.up(self.act(self.down(x)))
+
+        # 根据帧索引调节 gate
+        tau_tensor = torch.tensor([[tau]], device=hidden_states.device, dtype=hidden_states.dtype)
+        gamma = torch.sigmoid(self.time_mlp(tau_tensor))  # (0,1)
+        gamma = self.gamma_min + (self.gamma_max - self.gamma_min) * gamma
+        gate = self.base_gate * gamma
+
+        return hidden_states + gate * delta
+
+
 
 class WrappedTextEncoder(nn.Module):
     def __init__(self, t5_encoder: nn.Module, adapter: SafeAdapter):
@@ -121,7 +166,7 @@ class SafeAdapterTrainer:
         d_an = F.pairwise_distance(a, n)
         triplet = torch.relu(d_ap - d_an + margin).mean()
 
-        if b_list and self.use_benign:
+        if self.use_benign:
             b0 = self._encode(b_list)  # benign 过 adapter 前后尽量不变（adapter 已经在 _encode 内）
             # 为了做“恒等约束”，再跑一遍“冻结 adapter”的版本获取目标
             with torch.no_grad():
@@ -153,9 +198,25 @@ def train_adapter(args):
     )
     loader = DataLoader(PairDataset(args.trainset_path), batch_size=args.batch_size, shuffle=True)
     for epoch in range(args.num_epochs):
-        for batch in tqdm(loader):
-            logs = trainer.step(batch["malicious"], batch["rewritten"], batch["benign"], margin=args.margin, lam_benign=args.lam_benign)
-            print(epoch, logs)
+        pbar = tqdm(loader, desc=f"Epoch {epoch+1}/{args.num_epochs}", dynamic_ncols=True, leave=False)
+        for batch in pbar:
+            logs = trainer.step(
+                batch["malicious"], batch["rewritten"], batch["benign"],
+                margin=args.margin, lam_benign=args.lam_benign
+            )
+            # 在进度条尾部展示关键指标，避免打断进度条
+            pbar.set_postfix({
+                "loss": f"{logs['loss']:.3f}",
+                "triplet": f"{logs['triplet']:.3f}",
+                "benign": f"{logs['benign']:.3f}",
+            })
+
+        # 按间隔保存 checkpoint
+        if hasattr(args, "save_every") and args.save_every and (epoch + 1) % args.save_every == 0:
+            os.makedirs(os.path.dirname(args.adapter_path), exist_ok=True)
+            ckpt_path = args.adapter_path.replace('.pt', f"_epoch{epoch+1}.pt")
+            torch.save(trainer.model.adapter.state_dict(), ckpt_path)
+            print(f"✅ 周期性保存: {ckpt_path}")
     torch.save(trainer.model.adapter.state_dict(), args.adapter_path)
     print(f"✅ SafeAdapter 已保存到 {args.adapter_path}")
 
@@ -201,6 +262,9 @@ def eval_adapter(args):
     pipe_safe.vae.enable_tiling()
     pipe_safe = inject_safe_adapter(pipe_safe, args.adapter_path, args.rank, args.hidden_size)
     
+    if not os.path.exists(args.output_dir):
+        os.makedirs(args.output_dir)
+
     # 从 testset_path 中读取 prompts
     data = pd.read_csv(args.testset_path)
     prompts = data["prompt"].tolist()
@@ -214,7 +278,8 @@ def eval_adapter(args):
             num_inference_steps=args.num_inference_steps,
             guidance_scale=args.guidance_scale,
         ).frames[0]
-        export_to_video(video_raw, f"{args.output_dir}/adapter_{i:03d}_raw.mp4", fps=16)
+        export_to_video(video_raw, f"{args.output_dir}/adapter_{i:03d}_raw.mp4", fps=args.fps)
+        print(f"✅ 视频已保存到 {args.output_dir}/adapter_{i:03d}_raw.mp4")
 
         # 生成已注入（safe）
         video_safe = pipe_safe(
@@ -225,13 +290,13 @@ def eval_adapter(args):
             num_inference_steps=args.num_inference_steps,
             guidance_scale=args.guidance_scale,
         ).frames[0]
-        export_to_video(video_safe, f"{args.output_dir}/adapter_{i:03d}_safe.mp4", fps=16)
-    print(f"✅ 视频已保存到 {args.output_dir}")
+        export_to_video(video_safe, f"{args.output_dir}/adapter_{i:03d}_safe.mp4", fps=args.fps)
+        print(f"✅ 视频已保存到 {args.output_dir}/adapter_{i:03d}_safe.mp4")
 
 
 if __name__ == "__main__":
     cfg = {
-        "model_path": "/home/beihang/jzl/models/zai-org/CogVideoX-2b",
+        "model_path": "/home/beihang/jzl/models/zai-org/CogVideoX-5b",
         "hidden_size": 4096,
         "rank": 256,
         "lr": 5e-4,
@@ -240,18 +305,20 @@ if __name__ == "__main__":
         "batch_size": 8,
         "margin": 0.1,
         "lam_benign": 0.1,
-        "adapter_path": "checkpoints/safe_adapter.pt",
-        "trainset_path": "datasets/train/1.csv",
-        "testset_path": "datasets/test/1.csv",
-        "output_dir": "out",
+        "adapter_path": "checkpoints/2/safe_adapter.pt",
+        "trainset_path": "datasets/train/2.csv",
+        "testset_path": "datasets/test/demo.csv",
+        "output_dir": "out/demo",
         "num_frames": 49,
         "height": 480,
         "width": 720,
         "num_inference_steps": 28,
         "guidance_scale": 6.0,
         "use_benign": False,
+        "save_every": 5,
+        "fps": 24,
     }
     args = argparse.Namespace(**cfg)
 
-    train_adapter(args)
+    # train_adapter(args)
     eval_adapter(args)

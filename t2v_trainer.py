@@ -6,6 +6,10 @@ import os
 from pathlib import Path
 import shutil
 from typing import Any, Dict, List, Tuple
+
+# Disable PyTorch Dynamo to avoid conflicts with gradient checkpointing
+os.environ["TORCH_COMPILE"] = "0"
+os.environ["TORCHDYNAMO_DISABLE"] = "1"
 import diffusers
 import pandas as pd
 import torch
@@ -549,6 +553,7 @@ class TwoLossTrainer(Trainer):
             first_frame = latent[:, :, :1, :, :]  # Get first frame [B, C, 1, H, W]
             latent = torch.cat([first_frame.repeat(1, 1, ncopy, 1, 1), latent], dim=2)
             assert latent.shape[2] % patch_size_t == 0
+        return latent
 
     def training_step(self, batch):
         # 提取 prompt pair
@@ -687,6 +692,7 @@ class OneLossTrainer(Trainer):
             first_frame = latent[:, :, :1, :, :]  # Get first frame [B, C, 1, H, W]
             latent = torch.cat([first_frame.repeat(1, 1, ncopy, 1, 1), latent], dim=2)
             assert latent.shape[2] % patch_size_t == 0
+        return latent
 
     def training_step(self, batch):
         # 提取 prompt pair
@@ -695,8 +701,8 @@ class OneLossTrainer(Trainer):
         malicious_latent = batch["malicious_encoded_videos"]
         safe_latent = batch["safe_encoded_videos"]
 
-        self.reshape_latent(malicious_latent)
-        self.reshape_latent(safe_latent)
+        malicious_latent = self.reshape_latent(malicious_latent)
+        safe_latent = self.reshape_latent(safe_latent)
 
         batch_size, num_channels, num_frames, height, width = malicious_latent.shape
 
@@ -764,6 +770,107 @@ class OneLossTrainer(Trainer):
         self.accelerator.log({
             "loss/total": loss.detach().cpu().item(),
             "train/learning_rate": self.args.learning_rate,
+        }, step=self.global_step)
+
+        # Record loss info
+        self.loss_list.append({
+            "loss": loss.detach().cpu().item(),
+            "step": self.global_step
+        })
+
+        return loss
+
+
+class TITrainer(Trainer):
+    def __init__(self, args):
+        super().__init__(args)
+
+
+    def reshape_latent(self, latent):
+        # Shape of prompt_embedding: [B, seq_len, hidden_size]
+        # Shape of latent: [B, C, F, H, W]
+        patch_size_t = self.transformer.config.patch_size_t
+        if patch_size_t is not None:
+            ncopy = latent.shape[2] % patch_size_t
+            # Copy the first frame ncopy times to match patch_size_t
+            first_frame = latent[:, :, :1, :, :]  # Get first frame [B, C, 1, H, W]
+            latent = torch.cat([first_frame.repeat(1, 1, ncopy, 1, 1), latent], dim=2)
+            assert latent.shape[2] % patch_size_t == 0
+        return latent
+
+    def training_step(self, batch):
+        # 提取 prompt pair
+        pseudo_toxic = batch["pseudo_prompt"]
+        malicious_latent = batch["malicious_encoded_videos"]
+        safe_latent = batch["safe_encoded_videos"]
+
+        malicious_latent = self.reshape_latent(malicious_latent)
+        safe_latent = self.reshape_latent(safe_latent)
+
+        batch_size, num_channels, num_frames, height, width = malicious_latent.shape
+
+        # Get prompt embeddings
+        pseudo_prompt_embedding = self.encode_text(pseudo_toxic)
+
+        # Sample a random timestep for each sample
+        timesteps = torch.randint(
+            0,
+            self.noise_scheduler.config.num_train_timesteps,
+            (batch_size,),
+            device=self.accelerator.device,
+        )
+        timesteps = timesteps.long()
+
+        # Add noise to latent
+        malicious_latent = malicious_latent.permute(0, 2, 1, 3, 4)  # from [B, C, F, H, W] to [B, F, C, H, W]
+        noise = torch.randn_like(malicious_latent)
+        malicious_latent_added_noise = self.noise_scheduler.add_noise(malicious_latent, noise, timesteps)
+
+        safe_latent = safe_latent.permute(0, 2, 1, 3, 4)  # from [B, C, F, H, W] to [B, F, C, H, W]
+        noise = torch.randn_like(safe_latent)
+        safe_latent_added_noise = self.noise_scheduler.add_noise(safe_latent, noise, timesteps)
+
+
+        # Prepare rotary embeds
+        vae_scale_factor_spatial = 2 ** (len(self.vae.config.block_out_channels) - 1)
+        transformer_config = self.transformer.config
+        rotary_emb = (
+            self.prepare_rotary_positional_embeddings(
+                height=height * vae_scale_factor_spatial,
+                width=width * vae_scale_factor_spatial,
+                num_frames=num_frames,
+                transformer_config=transformer_config,
+                vae_scale_factor_spatial=vae_scale_factor_spatial,
+                device=self.accelerator.device,
+            )
+            if transformer_config.use_rotary_positional_embeddings
+            else None
+        )
+
+        # Predict noise
+        noise_pred_pseudo = self.transformer(
+            hidden_states=malicious_latent_added_noise,
+            encoder_hidden_states=pseudo_prompt_embedding,
+            timestep=timesteps,
+            image_rotary_emb=rotary_emb,
+            return_dict=False,
+        )[0]
+
+        noise_pred_safe = self.transformer(
+            hidden_states=safe_latent_added_noise,
+            encoder_hidden_states=pseudo_prompt_embedding,
+            timestep=timesteps,
+            image_rotary_emb=rotary_emb,
+            return_dict=False,
+        )[0]
+
+        # Compute losses
+        loss = F.mse_loss(noise_pred_pseudo, noise_pred_safe, reduction='mean')
+
+
+        # 记录日志
+        self.accelerator.log({
+            "loss/total": loss.detach().cpu().item(),
         }, step=self.global_step)
 
         # Record loss info
