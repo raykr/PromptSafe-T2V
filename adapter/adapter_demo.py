@@ -11,10 +11,13 @@ from diffusers import CogVideoXPipeline, CogVideoXDPMScheduler
 import pandas as pd
 from diffusers.utils import export_to_video
 
+from classifier import PromptSafetyClassifier
+
 class SafeAdapter(nn.Module):
     """
     冻结 T5 输出后，做一个小瓶颈 + 残差的安全映射层
-    H_safe = H + gate * MLP(LN(H))
+    H_safe = H + gate * scale * MLP(LN(H))
+    其中 scale 由外部动态控制（例如来自 prompt 分类器）
     """
 
     def __init__(self, hidden_size: int, rank: int = 256, init_gate: float = 0.5):
@@ -23,17 +26,32 @@ class SafeAdapter(nn.Module):
         self.down = nn.Linear(hidden_size, rank, bias=False)
         self.up = nn.Linear(rank, hidden_size, bias=False)
         self.act = nn.GELU()
-        # 可学习 gate（也可以后续做成动态门控）
+        # 可学习 base gate
         self.gate = nn.Parameter(torch.tensor(init_gate))
 
         # 小初始化，避免一开始破坏分布
         nn.init.kaiming_uniform_(self.down.weight, a=math.sqrt(5))
         nn.init.zeros_(self.up.weight)
 
-    def forward(self, hidden_states: torch.Tensor):
+    def forward(self, hidden_states: torch.Tensor, scale: torch.Tensor | float = 1.0):
+        """
+        scale: 动态防御强度系数
+          - 可以是标量 float
+          - 也可以是 [B] 或 [B, 1, 1] 的 Tensor（会自动广播）
+        """
         x = self.ln(hidden_states)
-        delta = self.up(self.act(self.down(x)))
-        return hidden_states + self.gate * delta
+        delta = self.up(self.act(self.down(x)))  # [B, L, D]
+
+        gate = self.gate
+        if not torch.is_tensor(scale):
+            scale = torch.tensor(scale, device=hidden_states.device, dtype=hidden_states.dtype)
+        # scale 形状调整为 [B, 1, 1] 或 [1, 1, 1]，方便广播
+        while scale.dim() < hidden_states.dim():
+            scale = scale.unsqueeze(-1)
+
+        eff_gate = gate * scale  # [B,1,1] or [1,1,1]
+
+        return hidden_states + eff_gate * delta
 
 
 class TemporalSafeAdapter(nn.Module):
@@ -87,7 +105,19 @@ class WrappedTextEncoder(nn.Module):
             p.requires_grad_(False)
         self.adapter = adapter
 
-    # 🔧 diffusers 的 pipeline.to() 会读取这些属性
+        # 默认动态 scale = 1.0，可以在推理前由外部修改
+        self.adapter_scale = 1.0
+
+    # 🔧 对外暴露一个设置接口，方便在生成前根据 prompt 分类结果动态调节
+    def set_adapter_scale(self, scale: torch.Tensor | float):
+        """
+        scale 可以是:
+          - float 标量：对当前 batch 使用统一防御强度
+          - [B] Tensor：对 batch 内每个样本用不同强度
+        """
+        self.adapter_scale = scale
+
+    # diffusers 的 pipeline.to() 会读取这些属性
     @property
     def dtype(self):
         try:
@@ -111,9 +141,11 @@ class WrappedTextEncoder(nn.Module):
             return_dict=True,
         )
         hs = outputs.last_hidden_state  # [B, L, D]
-        hs_safe = self.adapter(hs)
+        # 将当前对象的 adapter_scale 传给 adapter
+        hs_safe = self.adapter(hs, scale=self.adapter_scale)
         outputs.last_hidden_state = hs_safe
         return outputs
+
 
 class PairDataset(Dataset):
     # items: (malicious, rewritten, benign)
@@ -136,6 +168,7 @@ class PairDataset(Dataset):
             "benign": self.benign[i]
         }
 
+
 class SafeAdapterTrainer:
     def __init__(self, model_path, hidden_size=4096, rank=256, lr=5e-4, device="cuda", use_benign=False):
         self.device = device
@@ -150,8 +183,8 @@ class SafeAdapterTrainer:
         batch = self.tokenizer(texts, padding=True, truncation=True, return_tensors="pt").to(self.device)
         with torch.no_grad():  # 只对 adapter 求梯度
             out = self.model.t5(**batch).last_hidden_state
-        # adapter 参与梯度
-        out = self.model.adapter(out)  # [B, L, D]
+        # adapter 参与梯度；训练阶段 scale 固定为 1.0
+        out = self.model.adapter(out, scale=1.0)  # [B, L, D]
         sent = out.mean(dim=1)  # 简单句向量池化
         return sent
 
@@ -246,22 +279,58 @@ def inject_safe_adapter(pipe, adapter_path, rank=256, hidden_size=4096):
     return pipe
 
 
+def load_prompt_classifier(args):
+    """
+    从 ckpt 加载 PromptSafetyClassifier，返回 (classifier, tokenizer, label_cols)
+    """
+    device = args.device
+    state = torch.load(args.cls_ckpt_path, map_location="cpu")
+    label_cols = state["label_cols"]
+
+    tokenizer = AutoTokenizer.from_pretrained(args.model_path, subfolder="tokenizer")
+    base = T5EncoderModel.from_pretrained(args.model_path, subfolder="text_encoder").to(device)
+
+    model = PromptSafetyClassifier(
+        t5_encoder=base,
+        hidden_size=args.hidden_size,
+        num_labels=len(label_cols),
+    ).to(device)
+    model.load_state_dict(state["state_dict"])
+    model.eval()
+
+    return model, tokenizer, label_cols
+
+
+@torch.no_grad()
+def compute_severity(probs: torch.Tensor) -> torch.Tensor:
+    """
+    一个简单的 severity 定义示例：
+      - probs: [B, num_labels]
+      - 返回 severity: [B] ∈ [0,1]
+    这里直接取所有类别概率的 max 作为整体有害程度，你可以根据需要改成加权和等。
+    """
+    severity, _ = probs.max(dim=-1)
+    return severity  # [B]
+
 def eval_adapter(args):
-    # 原始（未注入）pipeline
+    # 1) 原始（未注入）pipeline
     pipe_raw = CogVideoXPipeline.from_pretrained(args.model_path, torch_dtype=torch.float16)
     pipe_raw.scheduler = CogVideoXDPMScheduler.from_config(pipe_raw.scheduler.config, timestep_spacing="trailing")
     pipe_raw.to(args.device)
     pipe_raw.vae.enable_slicing()
     pipe_raw.vae.enable_tiling()
 
-    # 注入 SafeAdapter 的 pipeline
+    # 2) 注入 SafeAdapter 的 pipeline
     pipe_safe = CogVideoXPipeline.from_pretrained(args.model_path, torch_dtype=torch.float16)
     pipe_safe.scheduler = CogVideoXDPMScheduler.from_config(pipe_safe.scheduler.config, timestep_spacing="trailing")
     pipe_safe.to(args.device)
     pipe_safe.vae.enable_slicing()
     pipe_safe.vae.enable_tiling()
     pipe_safe = inject_safe_adapter(pipe_safe, args.adapter_path, args.rank, args.hidden_size)
-    
+
+    # 3) 加载 prompt 分类器（用于动态路由/强度控制）
+    cls_model, cls_tokenizer, cls_label_cols = load_prompt_classifier(args)
+
     if not os.path.exists(args.output_dir):
         os.makedirs(args.output_dir)
 
@@ -269,7 +338,27 @@ def eval_adapter(args):
     data = pd.read_csv(args.testset_path)
     prompts = data["prompt"].tolist()
     for i, prompt in enumerate(prompts):
-        # 生成未注入（raw）
+        # ---- 3.1 先用分类器预测该 prompt 的各类风险概率 ----
+        tok = cls_tokenizer([prompt], padding=True, truncation=True, return_tensors="pt").to(args.device)
+        logits = cls_model(tok["input_ids"], tok["attention_mask"])    # [1,num_labels]
+        probs = torch.sigmoid(logits)                                  # [1,num_labels]
+
+        severity = compute_severity(probs)[0].item()  # 标量 ∈ [0,1]
+        # 你可以根据需要对 severity 做一个映射，比如:
+        #   scale = 0.2 + 0.8 * severity
+        # 代表最低 0.2 强度，最高 1.0 强度
+        scale = 0.2 + 0.8 * severity
+
+        # 将动态 scale 写入 text_encoder
+        if hasattr(pipe_safe.text_encoder, "set_adapter_scale"):
+            pipe_safe.text_encoder.set_adapter_scale(scale)
+        else:
+            # 兼容性：旧版可以直接写属性
+            pipe_safe.text_encoder.adapter_scale = scale
+
+        print(f"[{i:03d}] prompt = {prompt[:40]}..., severity = {severity:.3f}, scale = {scale:.3f}")
+
+        # ---- 4) 生成未注入（raw） ----
         video_raw = pipe_raw(
             prompt=prompt,
             num_frames=args.num_frames,
@@ -281,7 +370,7 @@ def eval_adapter(args):
         export_to_video(video_raw, f"{args.output_dir}/adapter_{i:03d}_raw.mp4", fps=args.fps)
         print(f"✅ 视频已保存到 {args.output_dir}/adapter_{i:03d}_raw.mp4")
 
-        # 生成已注入（safe）
+        # ---- 5) 生成已注入（safe，动态强度）----
         video_safe = pipe_safe(
             prompt=prompt,
             num_frames=args.num_frames,
@@ -292,6 +381,7 @@ def eval_adapter(args):
         ).frames[0]
         export_to_video(video_safe, f"{args.output_dir}/adapter_{i:03d}_safe.mp4", fps=args.fps)
         print(f"✅ 视频已保存到 {args.output_dir}/adapter_{i:03d}_safe.mp4")
+
 
 
 if __name__ == "__main__":
@@ -305,18 +395,19 @@ if __name__ == "__main__":
         "batch_size": 8,
         "margin": 0.1,
         "lam_benign": 0.1,
-        "adapter_path": "checkpoints/2/safe_adapter.pt",
-        "trainset_path": "datasets/train/2.csv",
-        "testset_path": "datasets/test/demo.csv",
-        "output_dir": "out/demo",
-        "num_frames": 49,
+        "adapter_path": "checkpoints/4/safe_adapter.pt",
+        "cls_ckpt_path": "checkpoints/prompt_classifier.pt",
+        "trainset_path": "datasets/train/4.csv",
+        "testset_path": "datasets/train/4.csv",
+        "output_dir": "out/4_cls",
+        "num_frames": 81,
         "height": 480,
         "width": 720,
-        "num_inference_steps": 28,
+        "num_inference_steps": 50,
         "guidance_scale": 6.0,
         "use_benign": False,
         "save_every": 5,
-        "fps": 24,
+        "fps": 16,
     }
     args = argparse.Namespace(**cfg)
 
