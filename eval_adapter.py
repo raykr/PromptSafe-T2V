@@ -1,6 +1,7 @@
 import torch
 import pandas as pd
 import os
+import argparse
 from tqdm import tqdm
 from diffusers import CogVideoXPipeline, CogVideoXDPMScheduler
 from diffusers.utils import export_to_video
@@ -199,62 +200,174 @@ def route_from_probs(probs: torch.Tensor, label_cols: list[str], thresh: float =
 
 
 def eval_adapter_multi(args):
-    # 1) raw pipeline
-    pipe_raw = CogVideoXPipeline.from_pretrained(args.model_path, torch_dtype=torch.float16)
-    pipe_raw.scheduler = CogVideoXDPMScheduler.from_config(pipe_raw.scheduler.config, timestep_spacing="trailing")
-    pipe_raw.to(args.device)
-    pipe_raw.vae.enable_slicing()
-    pipe_raw.vae.enable_tiling()
+    # 1) raw pipeline (只在需要生成baseline时加载)
+    pipe_raw = None
+    if args.generate_baseline:
+        pipe_raw = CogVideoXPipeline.from_pretrained(args.model_path, torch_dtype=torch.float16)
+        pipe_raw.scheduler = CogVideoXDPMScheduler.from_config(pipe_raw.scheduler.config, timestep_spacing="trailing")
+        pipe_raw.to(args.device)
+        pipe_raw.vae.enable_slicing()
+        pipe_raw.vae.enable_tiling()
 
-    # 2) safe pipeline with multi adapters
-    pipe_safe = CogVideoXPipeline.from_pretrained(args.model_path, torch_dtype=torch.float16)
-    pipe_safe.scheduler = CogVideoXDPMScheduler.from_config(pipe_safe.scheduler.config, timestep_spacing="trailing")
-    pipe_safe.to(args.device)
-    pipe_safe.vae.enable_slicing()
-    pipe_safe.vae.enable_tiling()
+    # 2) safe pipeline with multi adapters (只在需要生成防御视频时加载)
+    pipe_safe = None
+    if args.generate_defense:
+        pipe_safe = CogVideoXPipeline.from_pretrained(args.model_path, torch_dtype=torch.float16)
+        pipe_safe.scheduler = CogVideoXDPMScheduler.from_config(pipe_safe.scheduler.config, timestep_spacing="trailing")
+        pipe_safe.to(args.device)
+        pipe_safe.vae.enable_slicing()
+        pipe_safe.vae.enable_tiling()
 
-    # 2.1 注入多 adapter
-    adapter_ckpt_map = args.adapter_ckpt_map  # dict[str,str]
-    pipe_safe = inject_multi_safe_adapters(pipe_safe, adapter_ckpt_map, args.rank, args.hidden_size)
+        # 2.1 注入多 adapter
+        adapter_ckpt_map = args.adapter_ckpt_map  # dict[str,str]
+        pipe_safe = inject_multi_safe_adapters(pipe_safe, adapter_ckpt_map, args.rank, args.hidden_size)
 
-    # 3) 加载 prompt 分类器
-    cls_model, cls_tokenizer, label_cols = load_prompt_classifier(args)
+    # 3) 加载 prompt 分类器 (只在需要生成防御视频时加载)
+    cls_model = None
+    cls_tokenizer = None
+    label_cols = None
+    if args.generate_defense:
+        cls_model, cls_tokenizer, label_cols = load_prompt_classifier(args)
 
     os.makedirs(args.output_dir, exist_ok=True)
     data = pd.read_csv(args.testset_path)
     prompts = data["prompt"].tolist()
 
     for i, prompt in enumerate(prompts):
-        # 3.1 先跑分类器
-        tok = cls_tokenizer([prompt], padding=True, truncation=True, return_tensors="pt").to(args.device)
-        logits = cls_model(tok["input_ids"], tok["attention_mask"])
-        probs = torch.sigmoid(logits)  # [1,C]
+        # 生成baseline视频
+        if args.generate_baseline:
+            baseline_path = f"{args.output_dir}/multi_{i:03d}_raw.mp4"
+            if os.path.exists(baseline_path) and args.skip_existing:
+                print(f"[{i:03d}] Baseline视频已存在，跳过: {baseline_path}")
+            else:
+                print(f"[{i:03d}] 生成baseline视频: {prompt[:40]}...")
+                video_raw = pipe_raw(
+                    prompt=prompt,
+                    num_frames=args.num_frames,
+                    height=args.height,
+                    width=args.width,
+                    num_inference_steps=args.num_inference_steps,
+                    guidance_scale=args.guidance_scale,
+                ).frames[0]
+                export_to_video(video_raw, baseline_path, fps=args.fps)
+                print(f"✅ Baseline视频已保存: {baseline_path}")
 
-        category, scale = route_from_probs(probs, label_cols, thresh=args.route_thresh)
+        # 生成防御视频
+        if args.generate_defense:
+            defense_path = f"{args.output_dir}/multi_{i:03d}_safe.mp4"
+            if os.path.exists(defense_path) and args.skip_existing:
+                print(f"[{i:03d}] 防御视频已存在，跳过: {defense_path}")
+            else:
+                # 3.1 先跑分类器
+                tok = cls_tokenizer([prompt], padding=True, truncation=True, return_tensors="pt").to(args.device)
+                logits = cls_model(tok["input_ids"], tok["attention_mask"])
+                probs = torch.sigmoid(logits)  # [1,C]
 
-        print(f"[{i:03d}] prompt={prompt[:40]}..., cat={category}, scale={scale:.3f}")
+                category, scale = route_from_probs(probs, label_cols, thresh=args.route_thresh)
 
-        # 3.2 设置当前路由
-        pipe_safe.text_encoder.set_adapter_route(category=category, scale=scale)
+                print(f"[{i:03d}] prompt={prompt[:40]}..., cat={category}, scale={scale:.3f}")
 
-        # 4) raw 生成
-        video_raw = pipe_raw(
-            prompt=prompt,
-            num_frames=args.num_frames,
-            height=args.height,
-            width=args.width,
-            num_inference_steps=args.num_inference_steps,
-            guidance_scale=args.guidance_scale,
-        ).frames[0]
-        export_to_video(video_raw, f"{args.output_dir}/multi_{i:03d}_raw.mp4", fps=args.fps)
+                # 3.2 设置当前路由
+                pipe_safe.text_encoder.set_adapter_route(category=category, scale=scale)
 
-        # 5) safe 生成（自动选 adapter + 强度）
-        video_safe = pipe_safe(
-            prompt=prompt,
-            num_frames=args.num_frames,
-            height=args.height,
-            width=args.width,
-            num_inference_steps=args.num_inference_steps,
-            guidance_scale=args.guidance_scale,
-        ).frames[0]
-        export_to_video(video_safe, f"{args.output_dir}/multi_{i:03d}_safe.mp4", fps=args.fps)
+                # 5) safe 生成（自动选 adapter + 强度）
+                video_safe = pipe_safe(
+                    prompt=prompt,
+                    num_frames=args.num_frames,
+                    height=args.height,
+                    width=args.width,
+                    num_inference_steps=args.num_inference_steps,
+                    guidance_scale=args.guidance_scale,
+                ).frames[0]
+                export_to_video(video_safe, defense_path, fps=args.fps)
+                print(f"✅ 防御视频已保存: {defense_path}")
+
+
+def parse_adapter_map(adapter_map_str: str) -> dict[str, str]:
+    """
+    解析adapter映射字符串，格式: "category1:path1,category2:path2"
+    例如: "sexual:checkpoints/sexual/safe_adapter.pt,violent:checkpoints/violent/safe_adapter.pt"
+    """
+    adapter_map = {}
+    for item in adapter_map_str.split(','):
+        if ':' not in item:
+            raise ValueError(f"无效的adapter映射格式: {item}，应为 'category:path'")
+        category, path = item.split(':', 1)
+        adapter_map[category.strip()] = path.strip()
+    return adapter_map
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="评估多分类SafeAdapter模型")
+    
+    # 必需参数
+    parser.add_argument("--testset_path", type=str, required=True,
+                        help="测试集CSV文件路径")
+    parser.add_argument("--output_dir", type=str, required=True,
+                        help="输出目录")
+    parser.add_argument("--adapter_map", type=str, required=True,
+                        help="Adapter映射，格式: 'category1:path1,category2:path2'")
+    
+    # 模型相关参数
+    parser.add_argument("--model_path", type=str,
+                        default="/home/beihang/jzl/models/zai-org/CogVideoX-5b",
+                        help="基础模型路径")
+    parser.add_argument("--hidden_size", type=int, default=4096,
+                        help="隐藏层大小")
+    parser.add_argument("--rank", type=int, default=256,
+                        help="Adapter的rank")
+    
+    # 分类器相关参数
+    parser.add_argument("--cls_ckpt_path", type=str, required=True,
+                        help="分类器checkpoint路径")
+    
+    # 生成控制参数
+    parser.add_argument("--generate_baseline", action="store_true",
+                        help="生成baseline视频（未使用adapter）")
+    parser.add_argument("--generate_defense", action="store_true",
+                        help="生成防御视频（使用adapter）")
+    parser.add_argument("--skip_existing", action="store_true",
+                        help="如果视频已存在则跳过")
+    
+    # 视频生成参数
+    parser.add_argument("--num_frames", type=int, default=49,
+                        help="视频帧数")
+    parser.add_argument("--height", type=int, default=480,
+                        help="视频高度")
+    parser.add_argument("--width", type=int, default=480,
+                        help="视频宽度")
+    parser.add_argument("--num_inference_steps", type=int, default=50,
+                        help="推理步数")
+    parser.add_argument("--guidance_scale", type=float, default=7.5,
+                        help="Guidance scale")
+    parser.add_argument("--fps", type=int, default=8,
+                        help="视频FPS")
+    
+    # 路由相关参数
+    parser.add_argument("--route_thresh", type=float, default=0.3,
+                        help="路由阈值（低于此值不启用adapter）")
+    
+    # 设备参数
+    parser.add_argument("--device", type=str, default="cuda",
+                        help="设备 (cuda/cpu)")
+    
+    args = parser.parse_args()
+    
+    # 验证至少选择一种生成模式
+    if not args.generate_baseline and not args.generate_defense:
+        parser.error("必须至少选择 --generate_baseline 或 --generate_defense 之一")
+    
+    # 解析adapter映射
+    args.adapter_ckpt_map = parse_adapter_map(args.adapter_map)
+    
+    print("=" * 60)
+    print("评估配置:")
+    print(f"  测试集: {args.testset_path}")
+    print(f"  输出目录: {args.output_dir}")
+    print(f"  生成baseline: {args.generate_baseline}")
+    print(f"  生成防御: {args.generate_defense}")
+    print(f"  跳过已存在: {args.skip_existing}")
+    print(f"  Adapter映射: {args.adapter_ckpt_map}")
+    print("=" * 60)
+    
+    eval_adapter_multi(args)
