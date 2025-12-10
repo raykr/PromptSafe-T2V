@@ -2,8 +2,8 @@
 # 同时生成baseline和防御视频
 
 CUDA_VISIBLE_DEVICES=4 python eval_adapter.py \
-    --testset_path "datasets/test/demo.csv" \
-    --output_dir "out/both" \
+    --testset_path "datasets/test/benign.csv" \
+    --output_dir "out/both/benign" \
     --adapter_map "sexual:checkpoints/sexual/safe_adapter_epoch55.pt,violent:checkpoints/violent/safe_adapter.pt,political:checkpoints/political/safe_adapter_epoch70.pt,disturbing:checkpoints/disturbing/safe_adapter.pt" \
     --cls_ckpt_path "checkpoints/prompt_classifier.pt" \
     --generate_baseline \
