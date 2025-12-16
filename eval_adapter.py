@@ -2,13 +2,16 @@ import torch
 import pandas as pd
 import os
 import argparse
+import random
+import numpy as np
+from contextlib import contextmanager
 from tqdm import tqdm
 from diffusers import CogVideoXPipeline, CogVideoXDPMScheduler
 from diffusers.utils import export_to_video
 from transformers import AutoTokenizer, T5EncoderModel
 from models import AdapterRouter, SafeAdapter, WrappedTextEncoderRouter
 from models import WrappedTextEncoder
-from classifier import PromptSafetyClassifier
+from train_classifier import PromptSafetyClassifier
 
 
 def inject_safe_adapter(pipe, adapter_path, rank=256, hidden_size=4096):
@@ -73,24 +76,49 @@ def inject_multi_safe_adapters(
     return pipe
 
 
+@contextmanager
+def temporary_device(model, target_device):
+    """
+    临时将模型移到目标设备，使用完后移回原设备
+    """
+    original_device = next(model.parameters()).device
+    moved = False
+    if original_device != target_device:
+        model.to(target_device)
+        moved = True
+    try:
+        yield model
+    finally:
+        if moved:
+            model.to(original_device)
+
+
 def load_prompt_classifier(args):
     """
     从 ckpt 加载 PromptSafetyClassifier，返回 (classifier, tokenizer, label_cols)
+    支持将分类器加载到不同的设备（如 CPU）以节省显存
     """
-    device = args.device
+    # 如果指定了 cls_device，使用它；否则默认使用 CPU 以节省显存
+    cls_device = getattr(args, "cls_device", None)
+    if cls_device is None:
+        cls_device = "cpu"  # 默认 offload 到 CPU
+    
     state = torch.load(args.cls_ckpt_path, map_location="cpu")
     label_cols = state["label_cols"]
 
     tokenizer = AutoTokenizer.from_pretrained(args.model_path, subfolder="tokenizer")
-    base = T5EncoderModel.from_pretrained(args.model_path, subfolder="text_encoder").to(device)
+    # 分类器加载到指定设备（通常是 CPU）
+    base = T5EncoderModel.from_pretrained(args.model_path, subfolder="text_encoder").to(cls_device)
 
     model = PromptSafetyClassifier(
         t5_encoder=base,
         hidden_size=args.hidden_size,
         num_labels=len(label_cols),
-    ).to(device)
+    ).to(cls_device)
     model.load_state_dict(state["state_dict"])
     model.eval()
+    
+    print(f"✅ 分类器已加载到设备: {cls_device} (Pipeline 在 {args.device})")
 
     return model, tokenizer, label_cols
 
@@ -107,6 +135,15 @@ def compute_severity(probs: torch.Tensor) -> torch.Tensor:
     return severity  # [B]
 
 def eval_adapter(args):
+    # 0) 固定随机种子，保证可复现
+    if getattr(args, "seed", None) is not None:
+        seed = int(args.seed)
+        random.seed(seed)
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
+
     # 1) 原始（未注入）pipeline (只在需要生成baseline时加载)
     pipe_raw = None
     if args.generate_baseline:
@@ -147,6 +184,10 @@ def eval_adapter(args):
                 print(f"[{i:03d}] Baseline视频已存在，跳过: {baseline_path}")
             else:
                 print(f"[{i:03d}] 生成baseline视频: {prompt[:40]}...")
+                # 为每个样本构造独立但可复现的 generator
+                gen = torch.Generator(device=args.device)
+                if getattr(args, "seed", None) is not None:
+                    gen.manual_seed(int(args.seed) + i)
                 video_raw = pipe_raw(
                     prompt=prompt,
                     num_frames=args.num_frames,
@@ -154,6 +195,7 @@ def eval_adapter(args):
                     width=args.width,
                     num_inference_steps=args.num_inference_steps,
                     guidance_scale=args.guidance_scale,
+                    generator=gen,
                 ).frames[0]
                 export_to_video(video_raw, baseline_path, fps=args.fps)
                 print(f"✅ Baseline视频已保存: {baseline_path}")
@@ -165,9 +207,16 @@ def eval_adapter(args):
                 print(f"[{i:03d}] 防御视频已存在，跳过: {defense_path}")
             else:
                 # 3.1 先用分类器预测该 prompt 的各类风险概率
-                tok = cls_tokenizer([prompt], padding=True, truncation=True, return_tensors="pt").to(args.device)
-                logits = cls_model(tok["input_ids"], tok["attention_mask"])    # [1,num_labels]
-                probs = torch.sigmoid(logits)                                  # [1,num_labels]
+                # 如果分类器在 CPU，临时移到 GPU 进行推理
+                cls_device = getattr(args, "cls_device", "cpu")
+                inference_device = args.device if cls_device == "cpu" else cls_device
+                
+                with temporary_device(cls_model, inference_device):
+                    tok = cls_tokenizer([prompt], padding=True, truncation=True, return_tensors="pt").to(inference_device)
+                    logits = cls_model(tok["input_ids"], tok["attention_mask"])    # [1,num_labels]
+                    probs = torch.sigmoid(logits)                                  # [1,num_labels]
+                    # 移到 CPU 以便后续处理
+                    probs = probs.cpu()
 
                 severity = compute_severity(probs)[0].item()  # 标量 ∈ [0,1]
                 # 你可以根据需要对 severity 做一个映射，比如:
@@ -185,6 +234,9 @@ def eval_adapter(args):
                 print(f"[{i:03d}] prompt = {prompt[:40]}..., severity = {severity:.3f}, scale = {scale:.3f}")
 
                 # 5) 生成已注入（safe，动态强度）
+                gen = torch.Generator(device=args.device)
+                if getattr(args, "seed", None) is not None:
+                    gen.manual_seed(int(args.seed) + i)
                 video_safe = pipe_safe(
                     prompt=prompt,
                     num_frames=args.num_frames,
@@ -192,6 +244,7 @@ def eval_adapter(args):
                     width=args.width,
                     num_inference_steps=args.num_inference_steps,
                     guidance_scale=args.guidance_scale,
+                    generator=gen,
                 ).frames[0]
                 export_to_video(video_safe, defense_path, fps=args.fps)
                 print(f"✅ 防御视频已保存: {defense_path}")
@@ -220,6 +273,14 @@ def route_from_probs(probs: torch.Tensor, label_cols: list[str], thresh: float =
 
 
 def eval_adapter_multi(args):
+    # 0) 固定随机种子，保证可复现
+    if getattr(args, "seed", None) is not None:
+        seed = int(args.seed)
+        random.seed(seed)
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
     # 1) raw pipeline (只在需要生成baseline时加载)
     pipe_raw = None
     if args.generate_baseline:
@@ -261,6 +322,9 @@ def eval_adapter_multi(args):
                 print(f"[{i:03d}] Baseline视频已存在，跳过: {baseline_path}")
             else:
                 print(f"[{i:03d}] 生成baseline视频: {prompt[:40]}...")
+                gen = torch.Generator(device=args.device)
+                if getattr(args, "seed", None) is not None:
+                    gen.manual_seed(int(args.seed) + i)
                 video_raw = pipe_raw(
                     prompt=prompt,
                     num_frames=args.num_frames,
@@ -268,6 +332,7 @@ def eval_adapter_multi(args):
                     width=args.width,
                     num_inference_steps=args.num_inference_steps,
                     guidance_scale=args.guidance_scale,
+                    generator=gen,
                 ).frames[0]
                 export_to_video(video_raw, baseline_path, fps=args.fps)
                 print(f"✅ Baseline视频已保存: {baseline_path}")
@@ -279,9 +344,16 @@ def eval_adapter_multi(args):
                 print(f"[{i:03d}] 防御视频已存在，跳过: {defense_path}")
             else:
                 # 3.1 先跑分类器
-                tok = cls_tokenizer([prompt], padding=True, truncation=True, return_tensors="pt").to(args.device)
-                logits = cls_model(tok["input_ids"], tok["attention_mask"])
-                probs = torch.sigmoid(logits)  # [1,C]
+                # 如果分类器在 CPU，临时移到 GPU 进行推理
+                cls_device = getattr(args, "cls_device", "cpu")
+                inference_device = args.device if cls_device == "cpu" else cls_device
+                
+                with temporary_device(cls_model, inference_device):
+                    tok = cls_tokenizer([prompt], padding=True, truncation=True, return_tensors="pt").to(inference_device)
+                    logits = cls_model(tok["input_ids"], tok["attention_mask"])
+                    probs = torch.sigmoid(logits)  # [1,C]
+                    # 移到 CPU 以便后续处理
+                    probs = probs.cpu()
 
                 category, scale = route_from_probs(probs, label_cols, thresh=args.route_thresh)
 
@@ -291,6 +363,9 @@ def eval_adapter_multi(args):
                 pipe_safe.text_encoder.set_adapter_route(category=category, scale=scale)
 
                 # 5) safe 生成（自动选 adapter + 强度）
+                gen = torch.Generator(device=args.device)
+                if getattr(args, "seed", None) is not None:
+                    gen.manual_seed(int(args.seed) + i)
                 video_safe = pipe_safe(
                     prompt=prompt,
                     num_frames=args.num_frames,
@@ -298,6 +373,7 @@ def eval_adapter_multi(args):
                     width=args.width,
                     num_inference_steps=args.num_inference_steps,
                     guidance_scale=args.guidance_scale,
+                    generator=gen,
                 ).frames[0]
                 export_to_video(video_safe, defense_path, fps=args.fps)
                 print(f"✅ 防御视频已保存: {defense_path}")
@@ -338,7 +414,7 @@ if __name__ == "__main__":
     
     # 模型相关参数
     parser.add_argument("--model_path", type=str,
-                        default="/home/beihang/jzl/models/zai-org/CogVideoX-5b",
+                        default="/home/raykr/models/zai-org/CogVideoX-2b",
                         help="基础模型路径")
     parser.add_argument("--hidden_size", type=int, default=4096,
                         help="隐藏层大小")
@@ -370,6 +446,8 @@ if __name__ == "__main__":
                         help="Guidance scale")
     parser.add_argument("--fps", type=int, default=8,
                         help="视频FPS")
+    parser.add_argument("--seed", type=int, default=42,
+                        help="随机种子（保证生成可复现）")
     
     # 路由相关参数（仅multi模式）
     parser.add_argument("--route_thresh", type=float, default=0.3,
@@ -377,7 +455,9 @@ if __name__ == "__main__":
     
     # 设备参数
     parser.add_argument("--device", type=str, default="cuda",
-                        help="设备 (cuda/cpu)")
+                        help="Pipeline 设备 (cuda/cpu)")
+    parser.add_argument("--cls_device", type=str, default="cpu",
+                        help="分类器设备 (默认 cpu 以节省显存，可设为 cuda/cuda:0/cuda:1 等)")
     
     args = parser.parse_args()
     
@@ -390,14 +470,15 @@ if __name__ == "__main__":
         parser.error("生成防御视频需要 --cls_ckpt_path 参数")
     
     # 根据模式验证参数
-    if args.mode == "single":
-        if args.adapter_path is None:
-            parser.error("single模式需要 --adapter_path 参数")
-    elif args.mode == "multi":
-        if args.adapter_map is None:
-            parser.error("multi模式需要 --adapter_map 参数")
-        # 解析adapter映射
-        args.adapter_ckpt_map = parse_adapter_map(args.adapter_map)
+    if not args.generate_baseline:
+        if args.mode == "single":
+            if args.adapter_path is None:
+                parser.error("single模式需要 --adapter_path 参数")
+        elif args.mode == "multi":
+            if args.adapter_map is None:
+                parser.error("multi模式需要 --adapter_map 参数")
+            # 解析adapter映射
+            args.adapter_ckpt_map = parse_adapter_map(args.adapter_map)
     
     print("=" * 60)
     print("评估配置:")

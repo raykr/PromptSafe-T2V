@@ -146,16 +146,16 @@ def train_prompt_classifier(args):
 
 if __name__ == "__main__":
     cfg = {
-        "model_path": "/home/beihang/jzl/models/zai-org/CogVideoX-5b",
+        "model_path": "/home/raykr/models/zai-org/CogVideoX-2b",
         "hidden_size": 4096,
         "label_cols": ["sexual", "violent", "political", "disturbing"],
         "cls_trainset_path": "datasets/train/classification.csv",
-        "cls_ckpt_path": "checkpoints/prompt_classifier.pt",
+        "cls_ckpt_path": "checkpoints/classifier/prompt_classifier.pt",
         "cls_lr": 1e-4,
         "cls_batch_size": 8,
         "cls_num_epochs": 10,
         "cls_save_every": 5,
-        "device": "cuda:4",
+        "device": "cuda:0",
     }
     args = argparse.Namespace(**cfg)
     train_prompt_classifier(args)

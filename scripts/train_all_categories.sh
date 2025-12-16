@@ -15,7 +15,7 @@ for category in "${categories[@]}"; do
     
     python train_adapter.py \
         --category "$category" \
-        --model_path "/home/beihang/jzl/models/zai-org/CogVideoX-5b" \
+        --model_path "/home/raykr/models/zai-org/CogVideoX-2b" \
         --hidden_size 4096 \
         --rank 256 \
         --lr 5e-4 \

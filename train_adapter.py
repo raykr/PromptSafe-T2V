@@ -103,7 +103,7 @@ if __name__ == "__main__":
     
     # 模型相关参数
     parser.add_argument("--model_path", type=str,
-                        default="/home/beihang/jzl/models/zai-org/CogVideoX-5b",
+                        default="/home/raykr/models/zai-org/CogVideoX-2b",
                         help="基础模型路径")
     parser.add_argument("--hidden_size", type=int, default=4096,
                         help="隐藏层大小")
