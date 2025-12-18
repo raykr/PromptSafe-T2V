@@ -1,13 +1,12 @@
 #!/bin/bash
-# 单adapter模式：同时生成baseline和防御视频
+# 单adapter模式：只生成防御视频（使用adapter）
 
-CUDA_VISIBLE_DEVICES=4 python eval_adapter.py \
+CUDA_VISIBLE_DEVICES=4 python infer_adapter.py \
     --mode single \
     --testset_path "datasets/test/toxic.csv" \
     --output_dir "out/single/toxic" \
     --adapter_path "checkpoints/sexual/safe_adapter_epoch55.pt" \
     --cls_ckpt_path "checkpoints/classifier/prompt_classifier.pt" \
-    --generate_baseline \
     --generate_defense \
     --skip_existing \
     --num_frames 49 \

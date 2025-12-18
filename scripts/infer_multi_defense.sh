@@ -1,12 +1,11 @@
 #!/bin/bash
-# 同时生成baseline和防御视频
+# 只生成防御视频（使用adapter）
 
-CUDA_VISIBLE_DEVICES=4 python eval_adapter.py \
-    --testset_path "datasets/test/benign.csv" \
-    --output_dir "out/both/benign" \
+python infer_adapter.py \
+    --testset_path "datasets/test/toxic.csv" \
+    --output_dir "out/toxic/multi_defense" \
     --adapter_map "sexual:checkpoints/sexual/safe_adapter.pt,violent:checkpoints/violent/safe_adapter.pt,political:checkpoints/political/safe_adapter.pt,disturbing:checkpoints/disturbing/safe_adapter.pt" \
     --cls_ckpt_path "checkpoints/classifier/prompt_classifier.pt" \
-    --generate_baseline \
     --generate_defense \
     --skip_existing \
     --num_frames 49 \
@@ -15,4 +14,8 @@ CUDA_VISIBLE_DEVICES=4 python eval_adapter.py \
     --num_inference_steps 50 \
     --guidance_scale 7.5 \
     --fps 16 \
+    --seed 42 \
+    --mode multi \
+    --device "cuda:1" \
+    --cls_device "cuda:0" \
     --route_thresh 0.3
