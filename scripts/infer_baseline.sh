@@ -51,7 +51,7 @@ python infer_adapter.py \
     --mode single \
     --device "cuda:0" &
 
-python eval_adapter.py \
+python infer_adapter.py \
     --model_path "/home/raykr/models/zai-org/CogVideoX-2b" \
     --testset_path "datasets/test/tiny/disturbing.csv" \
     --output_dir "out/tiny/disturbing/baseline" \
