@@ -13,6 +13,129 @@ from models import AdapterRouter, SafeAdapter, WrappedTextEncoderRouter
 from models import WrappedTextEncoder
 from train_classifier import PromptSafetyClassifier
 
+# 尝试导入 WanPipeline（如果可用）
+# 先导入 ftfy 并确保它在全局命名空间中（WanPipeline 内部需要但可能没有正确导入）
+try:
+    import ftfy
+    import sys
+    import builtins
+    # 确保 ftfy 在 sys.modules 和 builtins 中，这样 WanPipeline 内部可以找到它
+    sys.modules['ftfy'] = ftfy
+    builtins.ftfy = ftfy
+except ImportError:
+    ftfy = None
+    print("⚠️ 警告: ftfy 未安装，WanPipeline 可能需要它。请运行: pip install ftfy")
+
+# 延迟导入 WanPipeline，在需要时再导入并修复 ftfy 问题
+WAN_PIPELINE_AVAILABLE = False
+WanPipeline = None
+
+def _ensure_ftfy_for_wan():
+    """确保 ftfy 在 WanPipeline 模块中可用"""
+    try:
+        import ftfy
+        import sys
+        import builtins
+        # 确保 ftfy 在多个位置可用
+        sys.modules['ftfy'] = ftfy
+        builtins.ftfy = ftfy
+        
+        # 尝试在 pipeline_wan 模块中注入 ftfy
+        try:
+            # 先导入 diffusers.pipelines.wan 包
+            import diffusers.pipelines.wan
+            # 然后导入 pipeline_wan 模块
+            import diffusers.pipelines.wan.pipeline_wan as wan_pipeline_module
+            # 在模块级别注入 ftfy
+            wan_pipeline_module.ftfy = ftfy
+            # 也尝试在包的 __init__ 中注入
+            if hasattr(diffusers.pipelines.wan, '__init__'):
+                diffusers.pipelines.wan.ftfy = ftfy
+        except (ImportError, AttributeError) as e:
+            # 如果导入失败，尝试直接访问已加载的模块
+            import importlib
+            try:
+                wan_pipeline_module = sys.modules.get('diffusers.pipelines.wan.pipeline_wan')
+                if wan_pipeline_module:
+                    wan_pipeline_module.ftfy = ftfy
+            except:
+                pass
+        return True
+    except ImportError:
+        return False
+
+def _try_import_wan_pipeline():
+    """尝试导入 WanPipeline"""
+    global WAN_PIPELINE_AVAILABLE, WanPipeline
+    if _ensure_ftfy_for_wan():
+        try:
+            from diffusers import WanPipeline
+            WAN_PIPELINE_AVAILABLE = True
+            return WanPipeline
+        except (ImportError, AttributeError):
+            try:
+                from diffusers.pipelines.wan.pipeline_wan import WanPipeline
+                WAN_PIPELINE_AVAILABLE = True
+                return WanPipeline
+            except ImportError:
+                pass
+    return None
+
+
+def load_pipeline(model_path: str, model_type: str, device: str = "cuda", torch_dtype=torch.float16):
+    """
+    根据模型类型加载相应的 pipeline
+    model_type: 'cogvideox' 或 'wan'
+    """
+    if model_type == "wan":
+        # 尝试导入 WanPipeline（如果还没有导入）
+        global WanPipeline, WAN_PIPELINE_AVAILABLE
+        if WanPipeline is None:
+            WanPipeline = _try_import_wan_pipeline()
+        
+        if not WAN_PIPELINE_AVAILABLE or WanPipeline is None:
+            raise ImportError("WanPipeline 不可用，请确保安装了支持 Wan2.1 的 diffusers 版本")
+        
+        # 在加载 pipeline 之前，确保 ftfy 在全局命名空间中可用
+        _ensure_ftfy_for_wan()
+        
+        pipe = WanPipeline.from_pretrained(model_path, torch_dtype=torch_dtype)
+        # WanPipeline 使用 UniPCMultistepScheduler，通常不需要额外配置
+        # 但可以检查是否需要 enable_slicing/tiling
+        if hasattr(pipe.vae, 'enable_slicing'):
+            pipe.vae.enable_slicing()
+        if hasattr(pipe.vae, 'enable_tiling'):
+            pipe.vae.enable_tiling()
+    else:  # cogvideox
+        pipe = CogVideoXPipeline.from_pretrained(model_path, torch_dtype=torch.float16)
+        pipe.scheduler = CogVideoXDPMScheduler.from_config(pipe.scheduler.config, timestep_spacing="trailing")
+        pipe.vae.enable_slicing()
+        pipe.vae.enable_tiling()
+    
+    pipe.to(device)
+    return pipe, model_type
+
+
+def get_pipeline_kwargs(model_type: str, prompt: str, num_frames: int, height: int, width: int,
+                       num_inference_steps: int, guidance_scale: float, generator: torch.Generator):
+    """
+    根据模型类型生成 pipeline 调用参数
+    """
+    kwargs = {
+        "prompt": prompt,
+        "num_frames": num_frames,
+        "height": height,
+        "width": width,
+        "num_inference_steps": num_inference_steps,
+        "guidance_scale": guidance_scale,
+        "generator": generator,
+    }
+    # CogVideoX 需要 use_dynamic_cfg，Wan 可能不需要
+    if model_type == "cogvideox":
+        kwargs["use_dynamic_cfg"] = True
+    
+    return kwargs
+
 
 def inject_safe_adapter(pipe, adapter_path, rank=256, hidden_size=4096):
     # 1) 构建并加载 Adapter
@@ -147,20 +270,12 @@ def eval_adapter(args):
     # 1) 原始（未注入）pipeline (只在需要生成baseline时加载)
     pipe_raw = None
     if args.generate_baseline:
-        pipe_raw = CogVideoXPipeline.from_pretrained(args.model_path, torch_dtype=torch.float16)
-        pipe_raw.scheduler = CogVideoXDPMScheduler.from_config(pipe_raw.scheduler.config, timestep_spacing="trailing")
-        pipe_raw.to(args.device)
-        pipe_raw.vae.enable_slicing()
-        pipe_raw.vae.enable_tiling()
+        pipe_raw, _ = load_pipeline(args.model_path, args.model_type, args.device, torch.float16)
 
     # 2) 注入 SafeAdapter 的 pipeline (只在需要生成防御视频时加载)
     pipe_safe = None
     if args.generate_defense:
-        pipe_safe = CogVideoXPipeline.from_pretrained(args.model_path, torch_dtype=torch.float16)
-        pipe_safe.scheduler = CogVideoXDPMScheduler.from_config(pipe_safe.scheduler.config, timestep_spacing="trailing")
-        pipe_safe.to(args.device)
-        pipe_safe.vae.enable_slicing()
-        pipe_safe.vae.enable_tiling()
+        pipe_safe, _ = load_pipeline(args.model_path, args.model_type, args.device, torch.float16)
         pipe_safe = inject_safe_adapter(pipe_safe, args.adapter_path, args.rank, args.hidden_size)
 
     # 3) 加载 prompt 分类器（用于动态路由/强度控制）(只在需要生成防御视频时加载)
@@ -188,15 +303,11 @@ def eval_adapter(args):
                 gen = torch.Generator(device=args.device)
                 if getattr(args, "seed", None) is not None:
                     gen.manual_seed(int(args.seed) + i)
-                video_raw = pipe_raw(
-                    prompt=prompt,
-                    num_frames=args.num_frames,
-                    height=args.height,
-                    width=args.width,
-                    num_inference_steps=args.num_inference_steps,
-                    guidance_scale=args.guidance_scale,
-                    generator=gen,
-                ).frames[0]
+                pipe_kwargs = get_pipeline_kwargs(
+                    args.model_type, prompt, args.num_frames, args.height, args.width,
+                    args.num_inference_steps, args.guidance_scale, gen
+                )
+                video_raw = pipe_raw(**pipe_kwargs).frames[0]
                 export_to_video(video_raw, baseline_path, fps=args.fps)
                 print(f"✅ Baseline视频已保存: {baseline_path}")
 
@@ -237,15 +348,11 @@ def eval_adapter(args):
                 gen = torch.Generator(device=args.device)
                 if getattr(args, "seed", None) is not None:
                     gen.manual_seed(int(args.seed) + i)
-                video_safe = pipe_safe(
-                    prompt=prompt,
-                    num_frames=args.num_frames,
-                    height=args.height,
-                    width=args.width,
-                    num_inference_steps=args.num_inference_steps,
-                    guidance_scale=args.guidance_scale,
-                    generator=gen,
-                ).frames[0]
+                pipe_kwargs = get_pipeline_kwargs(
+                    args.model_type, prompt, args.num_frames, args.height, args.width,
+                    args.num_inference_steps, args.guidance_scale, gen
+                )
+                video_safe = pipe_safe(**pipe_kwargs).frames[0]
                 export_to_video(video_safe, defense_path, fps=args.fps)
                 print(f"✅ 防御视频已保存: {defense_path}")
 
@@ -281,23 +388,16 @@ def eval_adapter_multi(args):
         torch.manual_seed(seed)
         if torch.cuda.is_available():
             torch.cuda.manual_seed_all(seed)
+    
     # 1) raw pipeline (只在需要生成baseline时加载)
     pipe_raw = None
     if args.generate_baseline:
-        pipe_raw = CogVideoXPipeline.from_pretrained(args.model_path, torch_dtype=torch.float16)
-        pipe_raw.scheduler = CogVideoXDPMScheduler.from_config(pipe_raw.scheduler.config, timestep_spacing="trailing")
-        pipe_raw.to(args.device)
-        pipe_raw.vae.enable_slicing()
-        pipe_raw.vae.enable_tiling()
+        pipe_raw, _ = load_pipeline(args.model_path, args.model_type, args.device, torch.float16)
 
     # 2) safe pipeline with multi adapters (只在需要生成防御视频时加载)
     pipe_safe = None
     if args.generate_defense:
-        pipe_safe = CogVideoXPipeline.from_pretrained(args.model_path, torch_dtype=torch.float16)
-        pipe_safe.scheduler = CogVideoXDPMScheduler.from_config(pipe_safe.scheduler.config, timestep_spacing="trailing")
-        pipe_safe.to(args.device)
-        pipe_safe.vae.enable_slicing()
-        pipe_safe.vae.enable_tiling()
+        pipe_safe, _ = load_pipeline(args.model_path, args.model_type, args.device, torch.float16)
 
         # 2.1 注入多 adapter
         adapter_ckpt_map = args.adapter_ckpt_map  # dict[str,str]
@@ -325,15 +425,11 @@ def eval_adapter_multi(args):
                 gen = torch.Generator(device=args.device)
                 if getattr(args, "seed", None) is not None:
                     gen.manual_seed(int(args.seed) + i)
-                video_raw = pipe_raw(
-                    prompt=prompt,
-                    num_frames=args.num_frames,
-                    height=args.height,
-                    width=args.width,
-                    num_inference_steps=args.num_inference_steps,
-                    guidance_scale=args.guidance_scale,
-                    generator=gen,
-                ).frames[0]
+                pipe_kwargs = get_pipeline_kwargs(
+                    args.model_type, prompt, args.num_frames, args.height, args.width,
+                    args.num_inference_steps, args.guidance_scale, gen
+                )
+                video_raw = pipe_raw(**pipe_kwargs).frames[0]
                 export_to_video(video_raw, baseline_path, fps=args.fps)
                 print(f"✅ Baseline视频已保存: {baseline_path}")
 
@@ -366,15 +462,11 @@ def eval_adapter_multi(args):
                 gen = torch.Generator(device=args.device)
                 if getattr(args, "seed", None) is not None:
                     gen.manual_seed(int(args.seed) + i)
-                video_safe = pipe_safe(
-                    prompt=prompt,
-                    num_frames=args.num_frames,
-                    height=args.height,
-                    width=args.width,
-                    num_inference_steps=args.num_inference_steps,
-                    guidance_scale=args.guidance_scale,
-                    generator=gen,
-                ).frames[0]
+                pipe_kwargs = get_pipeline_kwargs(
+                    args.model_type, prompt, args.num_frames, args.height, args.width,
+                    args.num_inference_steps, args.guidance_scale, gen
+                )
+                video_safe = pipe_safe(**pipe_kwargs).frames[0]
                 export_to_video(video_safe, defense_path, fps=args.fps)
                 print(f"✅ 防御视频已保存: {defense_path}")
 
@@ -416,6 +508,8 @@ if __name__ == "__main__":
     parser.add_argument("--model_path", type=str,
                         default="/home/raykr/models/zai-org/CogVideoX-2b",
                         help="基础模型路径")
+    parser.add_argument("--model_type", type=str, choices=["cogvideox", "wan"], default="cogvideox",
+                        help="模型类型: cogvideox 或 wan")
     parser.add_argument("--hidden_size", type=int, default=4096,
                         help="隐藏层大小")
     parser.add_argument("--rank", type=int, default=256,
@@ -483,6 +577,7 @@ if __name__ == "__main__":
     print("=" * 60)
     print("评估配置:")
     print(f"  模式: {args.mode}")
+    print(f"  模型类型: {args.model_type}")
     print(f"  测试集: {args.testset_path}")
     print(f"  输出目录: {args.output_dir}")
     print(f"  生成baseline: {args.generate_baseline}")

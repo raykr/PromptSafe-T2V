@@ -10,8 +10,9 @@ import os
 from torch.utils.data import DataLoader
 
 class SafeAdapterTrainer:
-    def __init__(self, model_path, hidden_size=4096, rank=256, lr=5e-4, device="cuda", use_benign=False):
+    def __init__(self, model_path, hidden_size=4096, rank=256, lr=5e-4, device="cuda", use_benign=False, max_length=512):
         self.device = device
+        self.max_length = max_length
         self.tokenizer = AutoTokenizer.from_pretrained(model_path, subfolder="tokenizer")
         base = T5EncoderModel.from_pretrained(model_path, subfolder="text_encoder").to(device)
         adapter = SafeAdapter(hidden_size, rank)
@@ -20,7 +21,7 @@ class SafeAdapterTrainer:
         self.use_benign = use_benign
 
     def _encode(self, texts):
-        batch = self.tokenizer(texts, padding=True, truncation=True, return_tensors="pt").to(self.device)
+        batch = self.tokenizer(texts, padding=True, truncation=True, max_length=self.max_length, return_tensors="pt").to(self.device)
         with torch.no_grad():  # 只对 adapter 求梯度
             out = self.model.t5(**batch).last_hidden_state
         # adapter 参与梯度；训练阶段 scale 固定为 1.0
@@ -30,7 +31,7 @@ class SafeAdapterTrainer:
 
     def step(self, m_list, r_list, b_list=None, margin=0.3, lam_benign=0.1):
         # Anchor = adapter(T5(malicious)), Positive = T5(rewritten) 经 adapter
-        # 注意：正样本也过 adapter，适配器学“整体分布”映射更稳
+        # 注意：正样本也过 adapter，适配器学"整体分布"映射更稳
         a = self._encode(m_list)
         p = self._encode(r_list)
         n = self._encode(m_list)  # malicious 本身作 negative（不加 <safe>）
@@ -41,9 +42,9 @@ class SafeAdapterTrainer:
 
         if self.use_benign:
             b0 = self._encode(b_list)  # benign 过 adapter 前后尽量不变（adapter 已经在 _encode 内）
-            # 为了做“恒等约束”，再跑一遍“冻结 adapter”的版本获取目标
+            # 为了做"恒等约束"，再跑一遍"冻结 adapter"的版本获取目标
             with torch.no_grad():
-                batch_b = self.tokenizer(b_list, padding=True, truncation=True, return_tensors="pt").to(self.device)
+                batch_b = self.tokenizer(b_list, padding=True, truncation=True, max_length=self.max_length, return_tensors="pt").to(self.device)
                 b_ref = self.model.t5(**batch_b).last_hidden_state.mean(dim=1)
             benign_cons = F.mse_loss(b0, b_ref)
         else:
@@ -67,7 +68,7 @@ class SafeAdapterTrainer:
 def train_adapter(args):
     trainer = SafeAdapterTrainer(
         model_path=args.model_path,
-        hidden_size=args.hidden_size, rank=args.rank, lr=args.lr, device=args.device, use_benign=args.use_benign
+        hidden_size=args.hidden_size, rank=args.rank, lr=args.lr, device=args.device, use_benign=args.use_benign, max_length=args.max_length
     )
     loader = DataLoader(PairDataset(args.trainset_path), batch_size=args.batch_size, shuffle=True)
     for epoch in range(args.num_epochs):
@@ -135,6 +136,8 @@ if __name__ == "__main__":
                         help="是否使用benign样本")
     parser.add_argument("--save_every", type=int, default=5,
                         help="每N个epoch保存一次checkpoint (0表示不保存中间checkpoint)")
+    parser.add_argument("--max_length", type=int, default=512,
+                        help="文本最大长度（token数），超过会被截断")
     
     args = parser.parse_args()
     

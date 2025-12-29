@@ -146,13 +146,13 @@ def train_prompt_classifier(args):
 
 if __name__ == "__main__":
     cfg = {
-        "model_path": "/home/raykr/models/zai-org/CogVideoX-2b",
+        "model_path": "/home/raykr/models/Wan-AI/Wan2.1-T2V-1.3B-Diffusers",
         "hidden_size": 4096,
         "label_cols": ["sexual", "violent", "political", "disturbing"],
         "cls_trainset_path": "datasets/train/classification.csv",
-        "cls_ckpt_path": "checkpoints/classifier/prompt_classifier.pt",
+        "cls_ckpt_path": "checkpoints/wan2.1-t2v-1.3b-diffusers/classifier/prompt_classifier.pt",
         "cls_lr": 1e-4,
-        "cls_batch_size": 8,
+        "cls_batch_size": 2,
         "cls_num_epochs": 10,
         "cls_save_every": 5,
         "device": "cuda:0",
