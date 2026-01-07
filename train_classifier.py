@@ -130,15 +130,29 @@ def train_prompt_classifier(args):
         if hasattr(args, "cls_save_every") and args.cls_save_every and (epoch + 1) % args.cls_save_every == 0:
             os.makedirs(os.path.dirname(args.cls_ckpt_path), exist_ok=True)
             ckpt_path = args.cls_ckpt_path.replace(".pt", f"_epoch{epoch+1}.pt")
+            # 只保存分类头部分（head 和 ln），不保存 T5 encoder
+            classifier_state = {
+                "ln.weight": trainer.model.ln.weight.data,
+                "ln.bias": trainer.model.ln.bias.data,
+                "head.weight": trainer.model.head.weight.data,
+                "head.bias": trainer.model.head.bias.data,
+            }
             torch.save({
-                "state_dict": trainer.model.state_dict(),
+                "state_dict": classifier_state,
                 "label_cols": args.label_cols,
             }, ckpt_path)
             print(f"✅ 分类器周期性保存: {ckpt_path}")
 
     os.makedirs(os.path.dirname(args.cls_ckpt_path), exist_ok=True)
+    # 只保存分类头部分（head 和 ln），不保存 T5 encoder
+    classifier_state = {
+        "ln.weight": trainer.model.ln.weight.data,
+        "ln.bias": trainer.model.ln.bias.data,
+        "head.weight": trainer.model.head.weight.data,
+        "head.bias": trainer.model.head.bias.data,
+    }
     torch.save({
-        "state_dict": trainer.model.state_dict(),
+        "state_dict": classifier_state,
         "label_cols": args.label_cols,
     }, args.cls_ckpt_path)
     print(f"✅ PromptSafetyClassifier 已保存到 {args.cls_ckpt_path}")

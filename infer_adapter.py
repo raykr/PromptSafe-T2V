@@ -238,7 +238,21 @@ def load_prompt_classifier(args):
         hidden_size=args.hidden_size,
         num_labels=len(label_cols),
     ).to(cls_device)
-    model.load_state_dict(state["state_dict"])
+    
+    # 加载分类头参数（兼容旧格式：如果包含 encoder 参数则过滤掉）
+    saved_state = state["state_dict"]
+    model_state = model.state_dict()
+    
+    # 如果保存的是完整模型，只提取分类头部分
+    if "encoder" in saved_state or any(k.startswith("encoder.") for k in saved_state.keys()):
+        # 旧格式：包含 T5 encoder，只加载分类头部分
+        classifier_state = {k: v for k, v in saved_state.items() 
+                           if k.startswith("ln.") or k.startswith("head.")}
+    else:
+        # 新格式：只包含分类头
+        classifier_state = saved_state
+    
+    model.load_state_dict(classifier_state, strict=False)
     model.eval()
     
     print(f"✅ 分类器已加载到设备: {cls_device} (Pipeline 在 {args.device})")
@@ -389,6 +403,101 @@ def eval_adapter_multi(args):
         if torch.cuda.is_available():
             torch.cuda.manual_seed_all(seed)
     
+    os.makedirs(args.output_dir, exist_ok=True)
+    data = pd.read_csv(args.testset_path)
+    prompts = data["prompt"].tolist()
+    
+    # ========== 阶段1: 批量分类所有 prompts（如果生成防御视频） ==========
+    classification_results = None
+    if args.generate_defense:
+        print("=" * 60)
+        print("阶段1: 批量分类所有 prompts")
+        print("=" * 60)
+        
+        # 加载分类器
+        cls_model, cls_tokenizer, label_cols = load_prompt_classifier(args)
+        cls_device = getattr(args, "cls_device", "cpu")
+        
+        # 智能设备选择：处理 CUDA_VISIBLE_DEVICES 的情况
+        # 如果 cls_device 是 cuda 设备但不可用，则使用 pipeline 设备或 CPU
+        def get_available_device(preferred_device):
+            """获取可用的设备，如果 preferred_device 不可用则回退"""
+            if preferred_device == "cpu":
+                return "cpu"
+            if preferred_device.startswith("cuda"):
+                try:
+                    # 检查设备是否可用
+                    device_id = int(preferred_device.split(":")[1]) if ":" in preferred_device else 0
+                    if device_id < torch.cuda.device_count():
+                        test_tensor = torch.zeros(1).to(preferred_device)
+                        return preferred_device
+                except (RuntimeError, AssertionError, IndexError, ValueError):
+                    pass
+                # 设备不可用，尝试使用 cuda:0（在 CUDA_VISIBLE_DEVICES 下可能是唯一可用设备）
+                if torch.cuda.is_available():
+                    try:
+                        test_tensor = torch.zeros(1).to("cuda:0")
+                        return "cuda:0"
+                    except:
+                        pass
+            return "cpu"
+        
+        # 确定推理设备
+        if cls_device == "cpu":
+            # 如果分类器在 CPU，推理时可以使用 pipeline 设备（更高效）
+            inference_device = get_available_device(args.device)
+        else:
+            # 如果指定了 cls_device，优先使用它
+            inference_device = get_available_device(cls_device)
+            if inference_device != cls_device:
+                print(f"⚠️ 警告: {cls_device} 不可用，改用 {inference_device} 进行分类")
+        
+        # 批量分类所有 prompts
+        classification_results = []
+        batch_size = getattr(args, "cls_batch_size", 32)  # 可以批量处理提高效率
+        
+        with temporary_device(cls_model, inference_device):
+            for i in range(0, len(prompts), batch_size):
+                batch_prompts = prompts[i:i+batch_size]
+                batch_indices = list(range(i, min(i+batch_size, len(prompts))))
+                
+                # 批量 tokenize
+                tok = cls_tokenizer(
+                    batch_prompts, 
+                    padding=True, 
+                    truncation=True, 
+                    max_length=512,
+                    return_tensors="pt"
+                ).to(inference_device)
+                
+                # 批量推理
+                with torch.no_grad():
+                    logits = cls_model(tok["input_ids"], tok["attention_mask"])  # [B, C]
+                    probs = torch.sigmoid(logits).cpu()  # [B, C]
+                
+                # 保存每个 prompt 的分类结果
+                for j, prob in enumerate(probs):
+                    idx = batch_indices[j]
+                    category, scale = route_from_probs(prob.unsqueeze(0), label_cols, thresh=args.route_thresh)
+                    classification_results.append({
+                        "index": idx,
+                        "prompt": batch_prompts[j],
+                        "category": category,
+                        "scale": scale,
+                        "probs": prob.numpy()
+                    })
+                    print(f"[{idx:03d}] prompt={batch_prompts[j][:40]}..., cat={category}, scale={scale:.3f}")
+        
+        # 释放分类器显存
+        del cls_model, cls_tokenizer
+        torch.cuda.empty_cache() if torch.cuda.is_available() else None
+        print("✅ 分类完成，分类器显存已释放")
+        print("=" * 60)
+    
+    # ========== 阶段2: 生成视频 ==========
+    print("阶段2: 生成视频")
+    print("=" * 60)
+    
     # 1) raw pipeline (只在需要生成baseline时加载)
     pipe_raw = None
     if args.generate_baseline:
@@ -398,21 +507,14 @@ def eval_adapter_multi(args):
     pipe_safe = None
     if args.generate_defense:
         pipe_safe, _ = load_pipeline(args.model_path, args.model_type, args.device, torch.float16)
-
         # 2.1 注入多 adapter
         adapter_ckpt_map = args.adapter_ckpt_map  # dict[str,str]
         pipe_safe = inject_multi_safe_adapters(pipe_safe, adapter_ckpt_map, args.rank, args.hidden_size)
 
-    # 3) 加载 prompt 分类器 (只在需要生成防御视频时加载)
-    cls_model = None
-    cls_tokenizer = None
-    label_cols = None
-    if args.generate_defense:
-        cls_model, cls_tokenizer, label_cols = load_prompt_classifier(args)
-
-    os.makedirs(args.output_dir, exist_ok=True)
-    data = pd.read_csv(args.testset_path)
-    prompts = data["prompt"].tolist()
+    # 按索引排序分类结果（如果有）
+    if classification_results:
+        classification_results.sort(key=lambda x: x["index"])
+        classification_dict = {r["index"]: r for r in classification_results}
 
     for i, prompt in enumerate(prompts):
         # 生成baseline视频
@@ -439,26 +541,15 @@ def eval_adapter_multi(args):
             if os.path.exists(defense_path) and args.skip_existing:
                 print(f"[{i:03d}] 防御视频已存在，跳过: {defense_path}")
             else:
-                # 3.1 先跑分类器
-                # 如果分类器在 CPU，临时移到 GPU 进行推理
-                cls_device = getattr(args, "cls_device", "cpu")
-                inference_device = args.device if cls_device == "cpu" else cls_device
-                
-                with temporary_device(cls_model, inference_device):
-                    tok = cls_tokenizer([prompt], padding=True, truncation=True, return_tensors="pt").to(inference_device)
-                    logits = cls_model(tok["input_ids"], tok["attention_mask"])
-                    probs = torch.sigmoid(logits)  # [1,C]
-                    # 移到 CPU 以便后续处理
-                    probs = probs.cpu()
+                # 从预分类结果中获取路由信息
+                cls_result = classification_dict[i]
+                category = cls_result["category"]
+                scale = cls_result["scale"]
 
-                category, scale = route_from_probs(probs, label_cols, thresh=args.route_thresh)
-
-                print(f"[{i:03d}] prompt={prompt[:40]}..., cat={category}, scale={scale:.3f}")
-
-                # 3.2 设置当前路由
+                # 设置当前路由
                 pipe_safe.text_encoder.set_adapter_route(category=category, scale=scale)
 
-                # 5) safe 生成（自动选 adapter + 强度）
+                # 生成视频
                 gen = torch.Generator(device=args.device)
                 if getattr(args, "seed", None) is not None:
                     gen.manual_seed(int(args.seed) + i)
@@ -552,6 +643,8 @@ if __name__ == "__main__":
                         help="Pipeline 设备 (cuda/cpu)")
     parser.add_argument("--cls_device", type=str, default="cpu",
                         help="分类器设备 (默认 cpu 以节省显存，可设为 cuda/cuda:0/cuda:1 等)")
+    parser.add_argument("--cls_batch_size", type=int, default=32,
+                        help="分类器批量处理大小（用于批量分类所有 prompts，提高效率）")
     
     args = parser.parse_args()
     
