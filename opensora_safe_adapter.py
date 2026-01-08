@@ -25,6 +25,7 @@ This file is intentionally self-contained for your current pipeline style.
 """
 
 import os
+import sys
 import json
 import math
 import argparse
@@ -35,6 +36,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
+import numpy as np
+import imageio
 
 from transformers import T5Tokenizer, T5EncoderModel
 
@@ -181,12 +184,15 @@ class T5AdapterBank:
         """
         assert self.peft_model is not None
         if name is None:
-            self.peft_model.set_adapter(None)
+            # 禁用适配器：不调用 peft_model.set_adapter(None)，因为PEFT不允许
+            # 调用者应该直接使用 base_t5 而不是 peft_model
             self.active_adapter = None
             return
 
+        # 激活指定的适配器
         self.peft_model.set_adapter(name)
         self.active_adapter = name
+        
         # PEFT LoRA scaling: each lora layer has scaling = alpha/r; we can multiply.
         # Some PEFT versions expose `set_adapter` only; scaling can be done by
         # setting `lora_alpha` or using `peft_model.set_adapter` + manual scaling hook.
@@ -220,24 +226,175 @@ class T5AdapterBank:
 # ---------------------------
 # Open-Sora bindings (YOU MUST IMPLEMENT)
 # ---------------------------
-def load_opensora_components(opensora_repo: str, ckpt: str, device: torch.device):
+def load_opensora_components(opensora_repo: str, ckpt: str, device: torch.device, load_full_model: bool = False, 
+                              offload_model: bool = False, use_multi_gpu: bool = False):
     """
-    Return a dict with at least:
-      - tokenizer: T5Tokenizer
-      - text_encoder: T5EncoderModel (or compatible)
-      - opensora_model: the denoiser/DiT model
-      - vae: video VAE (optional depending on your sampler)
-      - scheduler/sampler: (optional)
-    You should build this by referencing your local Open-Sora inference script/config.
+    加载 Open-Sora 相关组件。
 
-    Open-Sora uses T5 encoder in their described pipeline. :contentReference[oaicite:1]{index=1}
+    参数:
+      - opensora_repo: 本地 Open-Sora 仓库路径（用于加载DiT和VAE）
+      - ckpt: 文本编码器模型路径或 HuggingFace 模型 ID
+      - device: 加载到的 torch 设备
+      - load_full_model: 是否加载完整的生成模型（DiT + VAE），推理时需要
+
+    返回:
+      dict 包含:
+        - tokenizer: T5Tokenizer
+        - text_encoder: T5EncoderModel
+        - model: MMDiT模型（如果load_full_model=True）
+        - model_ae: VAE解码器（如果load_full_model=True）
+        - model_clip: CLIP模型（如果load_full_model=True）
+        - opensora_repo: Open-Sora仓库路径
+        - config: 配置对象（如果load_full_model=True）
     """
-    raise NotImplementedError("Please implement this using your local Open-Sora checkout.")
+    # 加载 T5 文本编码器和 tokenizer
+    tokenizer = None
+    text_encoder = None
+
+    # 情况1：diffusers 风格子目录
+    tok_dir = os.path.join(ckpt, "tokenizer")
+    te_dir = os.path.join(ckpt, "text_encoder")
+
+    try:
+        if os.path.isdir(tok_dir) and os.path.isdir(te_dir):
+            print(f"[Open-Sora] 使用 diffusers 风格子目录加载 T5：{ckpt}")
+            tokenizer = T5Tokenizer.from_pretrained(tok_dir, legacy=True)
+            text_encoder = T5EncoderModel.from_pretrained(te_dir)
+        else:
+            # 情况2：直接作为模型ID或单一目录
+            print(f"[Open-Sora] 使用 HuggingFace 模型或本地目录加载 T5：{ckpt}")
+            tokenizer = T5Tokenizer.from_pretrained(ckpt, legacy=True)
+            text_encoder = T5EncoderModel.from_pretrained(ckpt)
+    except Exception as e:
+        raise RuntimeError(
+            f"[Open-Sora] 无法从 '{ckpt}' 加载 T5 tokenizer/text_encoder，"
+            f"请确认 ckpt 是有效的 T5 模型路径或 HuggingFace 模型ID。原始错误: {e}"
+        )
+
+    text_encoder = text_encoder.to(device)
+    text_encoder.eval()
+    print(f"[Open-Sora] T5加载完成")
+
+    # 如果需要加载完整模型（推理时）
+    model = None
+    model_ae = None
+    model_clip = None
+    config = None
+    
+    if load_full_model:
+        print(f"[Open-Sora] 开始加载完整生成模型（DiT + VAE + CLIP）...")
+        try:
+            # 添加Open-Sora代码到路径
+            if opensora_repo and os.path.exists(opensora_repo):
+                if opensora_repo not in sys.path:
+                    sys.path.insert(0, opensora_repo)
+                
+                # 导入Open-Sora的模块
+                from mmengine.config import Config
+                from opensora.registry import MODELS, build_module
+                from opensora.utils.sampling import prepare_models
+                
+                # 创建配置（使用默认配置）
+                # 模型权重路径
+                model_dir = "/home/raykr/models/hpcai-tech/Open-Sora-v2"
+                
+                config_dict = {
+                    "model": {
+                        "type": "flux",
+                        "from_pretrained": os.path.join(model_dir, "Open_Sora_v2.safetensors"),
+                        "guidance_embed": False,
+                        "fused_qkv": False,
+                        "use_liger_rope": True,
+                        "in_channels": 64,
+                        "vec_in_dim": 768,
+                        "context_in_dim": 4096,
+                        "hidden_size": 3072,
+                        "mlp_ratio": 4.0,
+                        "num_heads": 24,
+                        "depth": 19,
+                        "depth_single_blocks": 38,
+                        "axes_dim": [16, 56, 56],
+                        "theta": 10_000,
+                        "qkv_bias": True,
+                        "cond_embed": True,
+                    },
+                    "ae": {
+                        "type": "hunyuan_vae",
+                        "from_pretrained": os.path.join(model_dir, "hunyuan_vae.safetensors"),
+                        "in_channels": 3,
+                        "out_channels": 3,
+                        "layers_per_block": 2,
+                        "latent_channels": 16,
+                        "use_spatial_tiling": True,
+                        "use_temporal_tiling": False,
+                    },
+                    "t5": {
+                        "type": "text_embedder",
+                        "from_pretrained": ckpt,  # 使用传入的T5路径
+                        "max_length": 512,
+                        "shardformer": False,  # 禁用shardformer以便使用我们的adapted版本
+                    },
+                    "clip": {
+                        "type": "text_embedder",
+                        "from_pretrained": os.path.join(model_dir, "openai/clip-vit-large-patch14"),
+                        "max_length": 77,
+                    },
+                }
+                
+                config = Config(config_dict)
+                dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+                
+                # 清理GPU缓存
+                torch.cuda.empty_cache()
+                
+                # 使用Open-Sora的prepare_models加载
+                # offload_model=True 会将模型加载到CPU，推理时再移到GPU
+                model, model_ae, _, model_clip, optional_models = prepare_models(
+                    config, device, dtype, offload_model=offload_model
+                )
+                
+                # 如果使用多GPU，将模型包装为DataParallel
+                if use_multi_gpu and torch.cuda.device_count() > 1:
+                    print(f"[Open-Sora] 使用 {torch.cuda.device_count()} 个GPU进行推理")
+                    if not offload_model:  # 只有在模型在GPU上时才使用DataParallel
+                        model = torch.nn.DataParallel(model)
+                        model_ae = torch.nn.DataParallel(model_ae)
+                        # CLIP和T5通常较小，可以放在单个GPU上
+                
+                # 清理缓存
+                torch.cuda.empty_cache()
+                
+                print(f"[Open-Sora] ✅ 完整模型加载成功")
+                print(f"  - DiT模型: {type(model)}")
+                print(f"  - VAE模型: {type(model_ae)}")
+                print(f"  - CLIP模型: {type(model_clip)}")
+                
+        except Exception as e:
+            import traceback
+            print(f"[Open-Sora] ❌ 加载完整模型失败: {e}")
+            print(f"[Open-Sora] 错误详情:")
+            traceback.print_exc()
+            raise
+
+    return {
+        "tokenizer": tokenizer,
+        "text_encoder": text_encoder,
+        "model": model,
+        "model_ae": model_ae,
+        "model_clip": model_clip,
+        "opensora_repo": opensora_repo,
+        "config": config,
+        "offload_model": offload_model,  # 保存offload状态
+    }
 
 
-@torch.no_grad()
 def opensora_encode_prompt(tokenizer: T5Tokenizer, text_encoder: nn.Module, prompts: List[str], device: torch.device):
     """
+    Encode prompts using T5 encoder.
+    
+    Note: This function does NOT use @torch.no_grad() to allow gradient computation
+    during training. Use `with torch.no_grad():` when calling this function during inference.
+    
     Return:
       - embeds: [B, L, D]
       - attention_mask: [B, L]
@@ -246,13 +403,17 @@ def opensora_encode_prompt(tokenizer: T5Tokenizer, text_encoder: nn.Module, prom
         prompts,
         padding="max_length",
         truncation=True,
-        max_length=256,
+        max_length=256,  # 可以减小到128以节省内存
         return_tensors="pt",
     )
     input_ids = tok.input_ids.to(device)
     attn = tok.attention_mask.to(device)
+    
+    # 直接调用，不使用autocast（避免与gradient checkpointing冲突）
+    # 如果模型已经是FP16，会自动使用FP16计算
     out = text_encoder(input_ids=input_ids, attention_mask=attn)
     embeds = out.last_hidden_state
+    
     return embeds, attn
 
 
@@ -260,17 +421,228 @@ def opensora_encode_prompt(tokenizer: T5Tokenizer, text_encoder: nn.Module, prom
 def opensora_sample(components: dict, prompt_embeds: torch.Tensor, prompt_mask: torch.Tensor,
                     num_frames: int, height: int, width: int,
                     num_steps: int, guidance: float, seed: int,
-                    out_path: str):
+                    out_path: str, prompts: List[str] = None):
     """
     Run Open-Sora sampling given prepared prompt embeddings.
-
-    You need to:
-      - create initial noise latent
-      - do diffusion steps with CFG (if applicable)
-      - decode with VAE
-      - save video (e.g., mp4)
+    
+    使用Open-Sora官方API进行推理。
+    
+    参数:
+      - components: 包含模型组件的字典
+      - prompt_embeds: T5编码的文本embeddings [B, L, D]
+      - prompt_mask: attention mask [B, L]
+      - num_frames: 视频帧数
+      - height: 视频高度
+      - width: 视频宽度
+      - num_steps: 扩散步数
+      - guidance: 引导强度
+      - seed: 随机种子
+      - out_path: 输出视频路径
+      - prompts: 原始文本prompts（用于CLIP编码）
     """
-    raise NotImplementedError("Please implement this by adapting Open-Sora scripts/inference.py in your repo.")
+    device = prompt_embeds.device
+    dtype = prompt_embeds.dtype
+    
+    # 设置随机种子
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    np.random.seed(seed)
+    
+    # 获取模型组件
+    model = components.get("model")
+    model_ae = components.get("model_ae")
+    model_clip = components.get("model_clip")
+    opensora_repo = components.get("opensora_repo", "")
+    offload_model = components.get("offload_model", False)
+    
+    # 检查模型是否已加载
+    if model is None or model_ae is None:
+        raise RuntimeError(
+            "Open-Sora模型未加载。请确保在load_opensora_components中设置了load_full_model=True"
+        )
+    
+    # 如果模型在CPU上（offload模式），需要移到GPU进行推理
+    if offload_model:
+        print(f"[opensora_sample] 将模型从CPU移到GPU...")
+        model = model.to(device)
+        model_ae = model_ae.to(device)
+        if model_clip is not None:
+            model_clip = model_clip.to(device)
+        torch.cuda.empty_cache()
+    # 否则模型已经在GPU上，直接使用
+    
+    # 添加Open-Sora代码到路径
+    if opensora_repo and opensora_repo not in sys.path:
+        sys.path.insert(0, opensora_repo)
+    
+    # 导入Open-Sora的采样工具
+    from opensora.utils.sampling import (
+        SamplingOption,
+        prepare_api,
+        prepare_ids,
+        sanitize_sampling_option,
+    )
+    
+    # 准备采样选项
+    sampling_option = SamplingOption(
+        height=height,
+        width=width,
+        num_frames=num_frames,
+        num_steps=num_steps,
+        guidance=guidance,
+        seed=seed,
+        method="i2v",  # 使用I2V方法
+        shift=True,
+        temporal_reduction=4,
+        is_causal_vae=True,
+    )
+    sampling_option = sanitize_sampling_option(sampling_option)
+    
+    # 准备API函数（使用官方prepare_api）
+    # 注意：我们需要创建一个自定义的T5编码器包装，使用我们的adapted embeddings
+    api_fn = prepare_api(model, model_ae, None, model_clip, {})  # T5设为None，我们手动处理
+    
+    print(f"[opensora_sample] 开始生成视频...")
+    print(f"  尺寸: {width}x{height}, 帧数: {num_frames}, 步数: {num_steps}, 引导: {guidance}")
+    
+    # 准备CLIP编码（如果需要）
+    if model_clip is not None and prompts is not None:
+        from opensora.models.text.conditioner import HFEmbedder
+        if isinstance(model_clip, HFEmbedder):
+            clip_embeds = model_clip(prompts)
+        else:
+            clip_embeds = model_clip(prompts)
+    else:
+        # 如果没有CLIP，创建零向量
+        batch_size = prompt_embeds.shape[0]
+        clip_embeds = torch.zeros(batch_size, 77, 768, device=device, dtype=dtype)
+    
+    # 创建初始噪声（使用Open-Sora的get_noise函数）
+    from opensora.utils.sampling import get_noise
+    batch_size = prompt_embeds.shape[0]
+    z = get_noise(
+        batch_size,
+        height,
+        width,
+        num_frames,
+        device,
+        dtype,
+        seed,
+        patch_size=2,
+        channel=16,
+    )
+    
+    # 准备输入（使用prepare_ids，因为我们已经有T5 embeddings了）
+    inp = prepare_ids(z, prompt_embeds, clip_embeds)
+    
+    # 准备采样参数
+    # 我们需要手动调用denoiser，因为API函数期望使用T5编码器
+    from opensora.utils.sampling import (
+        SamplingMethod,
+        SamplingMethodDict,
+        get_schedule,
+        unpack,
+    )
+    
+    # 获取timesteps
+    timesteps = get_schedule(
+        num_steps,
+        (z.shape[-1] * z.shape[-2]) // 4,  # patch_size^2 = 4
+        num_frames,
+        shift=sampling_option.shift,
+    )
+    
+    # 使用I2V denoiser
+    denoiser = SamplingMethodDict[SamplingMethod.I2V]
+    
+    # 准备guidance（对于t2v，不需要image guidance）
+    text = prompts if prompts else [""] * batch_size
+    text, additional_inp = denoiser.prepare_guidance(
+        text=text,
+        optional_models={},
+        device=device,
+        dtype=dtype,
+        neg=None,
+        guidance_img=None,
+    )
+    
+    # 更新输入
+    inp.update(additional_inp)
+    
+    # 对于t2v，不需要references
+    masks = torch.zeros(batch_size, 1, num_frames, z.shape[-2], z.shape[-1], device=device, dtype=dtype)
+    masked_ref = torch.zeros_like(z)
+    inp["masks"] = masks
+    inp["masked_ref"] = masked_ref
+    inp["sigma_min"] = 1e-5
+    
+    # 运行去噪
+    print(f"[opensora_sample] 运行扩散采样...")
+    x = denoiser.denoise(
+        model,
+        **inp,
+        timesteps=timesteps,
+        guidance=guidance,
+        text_osci=False,
+        image_osci=False,
+        scale_temporal_osci=False,
+        flow_shift=None,
+        patch_size=2,
+    )
+    
+    # Unpack latent
+    x = unpack(x, height, width, num_frames, patch_size=2)
+    
+    # VAE解码前清理缓存
+    torch.cuda.empty_cache()
+    
+    # VAE解码
+    print(f"[opensora_sample] VAE解码...")
+    x = model_ae.decode(x)
+    x = x[:, :, :num_frames]  # 确保帧数正确
+    
+    # 如果使用offload，推理完成后将模型移回CPU（可选，节省GPU内存）
+    # 注意：如果后续还要推理，可以不移回CPU以保持速度
+    # if offload_model:
+    #     print(f"[opensora_sample] 将模型移回CPU以释放GPU内存...")
+    #     model = model.cpu()
+    #     model_ae = model_ae.cpu()
+    #     if model_clip is not None:
+    #         model_clip = model_clip.cpu()
+    #     torch.cuda.empty_cache()
+    
+    # 保存视频
+    print(f"[opensora_sample] 保存视频...")
+    try:
+        # 转换为numpy
+        video_np = x[0].cpu().numpy()  # [C, T, H, W]
+        
+        # 转换为 [T, H, W, C] 格式
+        video_np = np.transpose(video_np, (1, 2, 3, 0))  # [T, H, W, C]
+        
+        # 归一化到[0, 255]
+        if video_np.max() <= 1.0:
+            video_np = (video_np * 255).clip(0, 255)
+        video_np = video_np.astype(np.uint8)
+        
+        # 确保RGB格式
+        if video_np.shape[-1] == 1:
+            video_np = np.repeat(video_np, 3, axis=-1)
+        elif video_np.shape[-1] == 4:
+            video_np = video_np[:, :, :, :3]
+        
+        # 保存视频
+        os.makedirs(os.path.dirname(out_path) if os.path.dirname(out_path) else ".", exist_ok=True)
+        imageio.mimwrite(out_path, video_np, fps=8, codec="libx264", quality=8)
+        
+        print(f"[opensora_sample] ✅ 视频已保存到: {out_path}")
+        
+    except Exception as e:
+        print(f"[opensora_sample] 保存视频出错: {e}")
+        import traceback
+        traceback.print_exc()
+        raise
 
 
 # ---------------------------
@@ -288,6 +660,7 @@ def train_one_adapter(
     lambda_tox: float,
     lambda_preserve: float,
     grad_clip: float = 1.0,
+    use_gradient_checkpointing: bool = False,  # 默认禁用，避免梯度问题
 ):
     tokenizer: T5Tokenizer = components["tokenizer"]
 
@@ -301,6 +674,28 @@ def train_one_adapter(
         if "lora_" not in n:
             p.requires_grad = False
 
+    # Enable gradient checkpointing to save memory
+    # 注意：gradient checkpointing可能与某些模型配置不兼容，如果出错可以禁用
+    print(f"[{spec.name}] use_gradient_checkpointing={use_gradient_checkpointing}")
+    if use_gradient_checkpointing:
+        try:
+            # 尝试在base_model上启用
+            if hasattr(adapter_bank.peft_model, "base_model"):
+                base_model = adapter_bank.peft_model.base_model
+                if hasattr(base_model, "model") and hasattr(base_model.model, "gradient_checkpointing_enable"):
+                    base_model.model.gradient_checkpointing_enable()
+                    print(f"[{spec.name}] Gradient checkpointing enabled")
+                elif hasattr(base_model, "gradient_checkpointing_enable"):
+                    base_model.gradient_checkpointing_enable()
+                    print(f"[{spec.name}] Gradient checkpointing enabled (base_model)")
+                else:
+                    print(f"[{spec.name}] Warning: Model does not support gradient checkpointing, skipping")
+        except Exception as e:
+            print(f"[{spec.name}] Warning: Failed to enable gradient checkpointing: {e}")
+            print(f"[{spec.name}] Continuing without gradient checkpointing...")
+    else:
+        print(f"[{spec.name}] Gradient checkpointing disabled (default)")
+
     # Classifier frozen
     classifier.eval()
     for p in classifier.parameters():
@@ -309,20 +704,50 @@ def train_one_adapter(
     optim = torch.optim.AdamW(adapter_bank.trainable_parameters(), lr=lr)
 
     for ep in range(epochs):
-        for prompts, labels in train_loader:
+        for batch_idx, (prompts, labels) in enumerate(train_loader):
             # filter by this category
             keep = [i for i, y in enumerate(labels) if y == spec.name]
             if not keep:
                 continue
             prompts = [prompts[i] for i in keep]
 
-            # Base embeds (no adapter)
+            # Base embeds (no adapter) - detach to ensure no gradient flow
             adapter_bank.set_adapter(None)
-            base_embeds, attn = opensora_encode_prompt(tokenizer, adapter_bank.base_t5, prompts, device)
+            with torch.no_grad():
+                base_t5_model = adapter_bank.base_t5
+                base_embeds, attn = opensora_encode_prompt(tokenizer, base_t5_model, prompts, device)
+            base_embeds = base_embeds.detach()  # Ensure no gradient
+            
+            # Clear cache before forward pass
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
-            # Adapted embeds
+            # Adapted embeds - should have gradient for LoRA training
             adapter_bank.set_adapter(spec.name, scale=1.0)
+            # Ensure peft_model is in train mode for gradient computation
+            adapter_bank.peft_model.train()
+            
+            # 确保LoRA参数有梯度（双重检查）
+            trainable_count = 0
+            for name, param in adapter_bank.peft_model.named_parameters():
+                if "lora_" in name:
+                    param.requires_grad = True
+                    trainable_count += 1
+            
+            if trainable_count == 0:
+                raise RuntimeError(f"No LoRA parameters found! Check adapter configuration for {spec.name}")
+            
+            # 如果启用了gradient checkpointing，需要确保输入有requires_grad
+            # 但实际上input_ids不应该有梯度，所以gradient checkpointing可能不适用
+            if use_gradient_checkpointing:
+                print(f"[{spec.name}] Warning: Gradient checkpointing is enabled but may cause gradient issues with LoRA training")
+            
+            # 前向传播计算adapted_embeds（应该有梯度）
             adapted_embeds, attn2 = opensora_encode_prompt(tokenizer, adapter_bank.peft_model, prompts, device)
+            
+            # 验证adapted_embeds可以计算梯度（虽然embeds本身可能不直接requires_grad，
+            # 但通过计算图连接到LoRA参数，应该可以反向传播）
+            # 这里不检查adapted_embeds.requires_grad，因为它可能为False但仍有grad_fn
 
             # Toxic score for this category index
             y_idx = HARM_CATEGORIES.index(spec.name)
@@ -333,11 +758,51 @@ def train_one_adapter(
             preserve_loss = F.mse_loss(adapted_embeds, base_embeds)
 
             loss = lambda_tox * tox_loss + lambda_preserve * preserve_loss
+            
+            # 检查loss是否可以反向传播
+            if loss.grad_fn is None:
+                # 如果loss没有grad_fn，说明计算图断开
+                print(f"Error: loss has no grad_fn. Checking computation graph...")
+                print(f"  loss.requires_grad: {loss.requires_grad}")
+                print(f"  loss.grad_fn: {loss.grad_fn}")
+                print(f"  adapted_embeds.grad_fn: {adapted_embeds.grad_fn if hasattr(adapted_embeds, 'grad_fn') else 'N/A'}")
+                # 检查是否有可训练参数
+                trainable_params = [p for p in adapter_bank.peft_model.parameters() if p.requires_grad]
+                print(f"  Found {len(trainable_params)} trainable parameters")
+                if len(trainable_params) == 0:
+                    raise RuntimeError("No trainable parameters! Check LoRA configuration.")
+                
+                # 如果启用了gradient checkpointing，这是已知问题
+                if use_gradient_checkpointing:
+                    raise RuntimeError(
+                        "Loss has no gradient due to gradient checkpointing. "
+                        "Gradient checkpointing is incompatible with LoRA training. "
+                        "Please disable gradient checkpointing (set USE_GRADIENT_CHECKPOINTING=0)."
+                    )
+                else:
+                    raise RuntimeError("Loss has no gradient. Check model configuration and training setup.")
 
             optim.zero_grad(set_to_none=True)
             loss.backward()
+            
+            # 检查梯度是否存在
+            has_grad = any(p.grad is not None for p in adapter_bank.trainable_parameters())
+            if not has_grad:
+                print(f"Warning: No gradients found after backward pass!")
+                # 打印一些调试信息
+                for name, param in list(adapter_bank.peft_model.named_parameters())[:5]:
+                    if param.requires_grad:
+                        print(f"  {name}: requires_grad={param.requires_grad}, grad={param.grad is not None}")
+            
             nn.utils.clip_grad_norm_(adapter_bank.trainable_parameters(), grad_clip)
             optim.step()
+            
+            # Clear cache after each step
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            
+            if batch_idx % 10 == 0:
+                print(f"[{spec.name}] epoch {ep+1}/{epochs}, batch {batch_idx}, loss={loss.item():.4f}")
 
         print(f"[{spec.name}] epoch {ep+1}/{epochs} done")
 
@@ -393,6 +858,7 @@ def infer_with_dynamic_adapter(
         guidance=guidance,
         seed=seed,
         out_path=out_path,
+        prompts=[prompt],  # 传入原始prompt用于CLIP编码
     )
     print(f"[infer] category={category}, score={score:.4f}, scale={defense_scale}, saved={out_path}")
 
@@ -418,9 +884,13 @@ def main():
     ap.add_argument("--lr", type=float, default=1e-4)
     ap.add_argument("--lambda_tox", type=float, default=1.0)
     ap.add_argument("--lambda_preserve", type=float, default=0.1)
+    ap.add_argument("--use_gradient_checkpointing", action="store_true", help="Enable gradient checkpointing to save memory")
+    ap.add_argument("--multi_gpu", action="store_true", help="Use DataParallel for multi-GPU training")
 
     # Inference
     ap.add_argument("--prompt", type=str, default="")
+    ap.add_argument("--offload_model", action="store_true", help="Offload model to CPU to save GPU memory (slower but uses less GPU memory)")
+    ap.add_argument("--use_multi_gpu", action="store_true", help="Use multiple GPUs for inference (DataParallel)")
     ap.add_argument("--out", type=str, default="out.mp4")
     ap.add_argument("--defense_scale", type=float, default=1.0)
     ap.add_argument("--force_category", type=str, default="")
@@ -435,19 +905,59 @@ def main():
 
     args = ap.parse_args()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
+    # Check available GPUs
+    num_gpus = torch.cuda.device_count()
+    print(f"Available GPUs: {num_gpus}")
+    if args.multi_gpu and num_gpus > 1:
+        print(f"Using {num_gpus} GPUs with DataParallel")
+    else:
+        print(f"Using single GPU: {device}")
 
     # 1) Load Open-Sora + T5
-    components = load_opensora_components(args.opensora_repo, args.opensora_ckpt, device=device)
+    # For multi-GPU, load on first GPU, then wrap with DataParallel
+    primary_device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    # 推理时需要加载完整模型（DiT + VAE）
+    load_full = (args.mode == "infer")
+    
+    # 内存优化选项
+    offload_model = args.mode == "infer" and args.offload_model
+    use_multi_gpu = args.mode == "infer" and args.use_multi_gpu
+    
+    # 清理GPU内存
+    if args.mode == "infer":
+        torch.cuda.empty_cache()
+        import gc
+        gc.collect()
+    
+    components = load_opensora_components(
+        args.opensora_repo, 
+        args.opensora_ckpt, 
+        device=primary_device,
+        load_full_model=load_full,
+        offload_model=offload_model,
+        use_multi_gpu=use_multi_gpu
+    )
     tokenizer = components["tokenizer"]
     text_encoder = components["text_encoder"]
-    text_encoder.to(device).eval()
+    text_encoder.to(primary_device).eval()
+    
+    # Wrap with DataParallel if multi-GPU
+    if args.multi_gpu and num_gpus > 1:
+        text_encoder = nn.DataParallel(text_encoder)
+        print("Text encoder wrapped with DataParallel")
 
     # 2) Build adapter bank on T5
-    bank = T5AdapterBank(base_t5=text_encoder, adapter_root=args.adapter_root, device=device)
+    # For DataParallel, need to access the underlying model
+    base_t5_for_bank = text_encoder.module if isinstance(text_encoder, nn.DataParallel) else text_encoder
+    bank = T5AdapterBank(base_t5=base_t5_for_bank, adapter_root=args.adapter_root, device=primary_device)
 
     # 3) Load classifier (replace with your real one)
     # IMPORTANT: change hidden size in ToxicClassifier if your T5 dim != 4096.
-    classifier = ToxicClassifier(num_classes=len(HARM_CATEGORIES)).to(device).eval()
+    classifier = ToxicClassifier(num_classes=len(HARM_CATEGORIES)).to(primary_device).eval()
+    if args.multi_gpu and num_gpus > 1:
+        classifier = nn.DataParallel(classifier)
+        print("Classifier wrapped with DataParallel")
 
     if args.mode == "train":
         assert args.train_jsonl, "--train_jsonl required in train mode"
@@ -464,11 +974,12 @@ def main():
                 classifier=classifier,
                 spec=spec,
                 train_loader=dl,
-                device=device,
+                device=primary_device,
                 epochs=args.epochs,
                 lr=args.lr,
                 lambda_tox=args.lambda_tox,
                 lambda_preserve=args.lambda_preserve,
+                use_gradient_checkpointing=args.use_gradient_checkpointing,  # 默认False（因为action="store_true"，只有显式传入--use_gradient_checkpointing才是True）
             )
 
     else:  # infer
@@ -476,11 +987,27 @@ def main():
         for cat in HARM_CATEGORIES:
             spec = AdapterSpec(name=cat, out_dir=args.adapter_root)
             bank.add_adapter(spec)
-            adapter_dir = os.path.join(args.adapter_root, cat)
-            if os.path.isdir(adapter_dir):
+            # PEFT保存的路径可能是 adapter_root/cat/cat/ 或 adapter_root/cat/
+            adapter_dir1 = os.path.join(args.adapter_root, cat, cat)  # 嵌套结构
+            adapter_dir2 = os.path.join(args.adapter_root, cat)  # 扁平结构
+            adapter_dir = None
+            if os.path.isdir(adapter_dir1) and os.path.exists(os.path.join(adapter_dir1, "adapter_config.json")):
+                adapter_dir = adapter_dir1
+            elif os.path.isdir(adapter_dir2) and os.path.exists(os.path.join(adapter_dir2, "adapter_config.json")):
+                adapter_dir = adapter_dir2
+            elif os.path.isdir(adapter_dir2):
+                # 检查子目录
+                for subdir in os.listdir(adapter_dir2):
+                    subpath = os.path.join(adapter_dir2, subdir)
+                    if os.path.isdir(subpath) and os.path.exists(os.path.join(subpath, "adapter_config.json")):
+                        adapter_dir = subpath
+                        break
+            
+            if adapter_dir and os.path.isdir(adapter_dir):
+                print(f"[infer] Loading adapter from: {adapter_dir}")
                 bank.load_adapter(cat, adapter_dir, spec)
             else:
-                print(f"[warn] adapter dir not found: {adapter_dir} (skip load)")
+                print(f"[warn] adapter dir not found for {cat} (checked: {adapter_dir1}, {adapter_dir2})")
 
         force = args.force_category.strip() or None
         infer_with_dynamic_adapter(
