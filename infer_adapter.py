@@ -107,7 +107,7 @@ def load_pipeline(model_path: str, model_type: str, device: str = "cuda", torch_
         if hasattr(pipe.vae, 'enable_tiling'):
             pipe.vae.enable_tiling()
     else:  # cogvideox
-        pipe = CogVideoXPipeline.from_pretrained(model_path, torch_dtype=torch.float16)
+        pipe = CogVideoXPipeline.from_pretrained(model_path, torch_dtype=torch_dtype)
         pipe.scheduler = CogVideoXDPMScheduler.from_config(pipe.scheduler.config, timestep_spacing="trailing")
         pipe.vae.enable_slicing()
         pipe.vae.enable_tiling()
@@ -284,12 +284,12 @@ def eval_adapter(args):
     # 1) 原始（未注入）pipeline (只在需要生成baseline时加载)
     pipe_raw = None
     if args.generate_baseline:
-        pipe_raw, _ = load_pipeline(args.model_path, args.model_type, args.device, torch.float16)
+        pipe_raw, _ = load_pipeline(args.model_path, args.model_type, args.device, args.torch_dtype)
 
     # 2) 注入 SafeAdapter 的 pipeline (只在需要生成防御视频时加载)
     pipe_safe = None
     if args.generate_defense:
-        pipe_safe, _ = load_pipeline(args.model_path, args.model_type, args.device, torch.float16)
+        pipe_safe, _ = load_pipeline(args.model_path, args.model_type, args.device, args.torch_dtype)
         pipe_safe = inject_safe_adapter(pipe_safe, args.adapter_path, args.rank, args.hidden_size)
 
     # 3) 加载 prompt 分类器（用于动态路由/强度控制）(只在需要生成防御视频时加载)
@@ -321,8 +321,13 @@ def eval_adapter(args):
                     args.model_type, prompt, args.num_frames, args.height, args.width,
                     args.num_inference_steps, args.guidance_scale, gen
                 )
-                video_raw = pipe_raw(**pipe_kwargs).frames[0]
+                output = pipe_raw(**pipe_kwargs)
+                video_raw = output.frames[0]
                 export_to_video(video_raw, baseline_path, fps=args.fps)
+                # 释放显存
+                del video_raw, output, pipe_kwargs, gen
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
                 print(f"✅ Baseline视频已保存: {baseline_path}")
 
         # 生成防御视频
@@ -501,12 +506,12 @@ def eval_adapter_multi(args):
     # 1) raw pipeline (只在需要生成baseline时加载)
     pipe_raw = None
     if args.generate_baseline:
-        pipe_raw, _ = load_pipeline(args.model_path, args.model_type, args.device, torch.float16)
+        pipe_raw, _ = load_pipeline(args.model_path, args.model_type, args.device, args.torch_dtype)
 
     # 2) safe pipeline with multi adapters (只在需要生成防御视频时加载)
     pipe_safe = None
     if args.generate_defense:
-        pipe_safe, _ = load_pipeline(args.model_path, args.model_type, args.device, torch.float16)
+        pipe_safe, _ = load_pipeline(args.model_path, args.model_type, args.device, args.torch_dtype)
         # 2.1 注入多 adapter
         adapter_ckpt_map = args.adapter_ckpt_map  # dict[str,str]
         pipe_safe = inject_multi_safe_adapters(pipe_safe, adapter_ckpt_map, args.rank, args.hidden_size)
@@ -531,8 +536,13 @@ def eval_adapter_multi(args):
                     args.model_type, prompt, args.num_frames, args.height, args.width,
                     args.num_inference_steps, args.guidance_scale, gen
                 )
-                video_raw = pipe_raw(**pipe_kwargs).frames[0]
+                output = pipe_raw(**pipe_kwargs)
+                video_raw = output.frames[0]
                 export_to_video(video_raw, baseline_path, fps=args.fps)
+                # 释放显存
+                del video_raw, output, pipe_kwargs, gen
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
                 print(f"✅ Baseline视频已保存: {baseline_path}")
 
         # 生成防御视频
@@ -557,8 +567,13 @@ def eval_adapter_multi(args):
                     args.model_type, prompt, args.num_frames, args.height, args.width,
                     args.num_inference_steps, args.guidance_scale, gen
                 )
-                video_safe = pipe_safe(**pipe_kwargs).frames[0]
+                output = pipe_safe(**pipe_kwargs)
+                video_safe = output.frames[0]
                 export_to_video(video_safe, defense_path, fps=args.fps)
+                # 释放显存
+                del video_safe, output, pipe_kwargs, gen
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
                 print(f"✅ 防御视频已保存: {defense_path}")
 
 
@@ -574,6 +589,22 @@ def parse_adapter_map(adapter_map_str: str) -> dict[str, str]:
         category, path = item.split(':', 1)
         adapter_map[category.strip()] = path.strip()
     return adapter_map
+
+
+def parse_torch_dtype(dtype_str: str) -> torch.dtype:
+    """
+    将字符串转换为 torch.dtype
+    支持: "FP16", "FP32", "BF16"
+    """
+    dtype_map = {
+        "FP16": torch.float16,
+        "FP32": torch.float32,
+        "BF16": torch.bfloat16,
+    }
+    dtype_str = dtype_str.upper()
+    if dtype_str not in dtype_map:
+        raise ValueError(f"不支持的 torch_dtype: {dtype_str}，支持的类型: {list(dtype_map.keys())}")
+    return dtype_map[dtype_str]
 
 
 if __name__ == "__main__":
@@ -646,7 +677,15 @@ if __name__ == "__main__":
     parser.add_argument("--cls_batch_size", type=int, default=32,
                         help="分类器批量处理大小（用于批量分类所有 prompts，提高效率）")
     
+    # 数据类型参数
+    parser.add_argument("--torch_dtype", type=str, default="FP16",
+                        choices=["FP16", "FP32", "BF16"],
+                        help="模型加载的数据类型 (FP16/FP32/BF16，不同模型可能推荐不同)")
+    
     args = parser.parse_args()
+    
+    # 解析 torch_dtype 字符串为 torch.dtype
+    args.torch_dtype = parse_torch_dtype(args.torch_dtype)
     
     # 验证至少选择一种生成模式
     if not args.generate_baseline and not args.generate_defense:
@@ -671,6 +710,7 @@ if __name__ == "__main__":
     print("评估配置:")
     print(f"  模式: {args.mode}")
     print(f"  模型类型: {args.model_type}")
+    print(f"  数据类型: {args.torch_dtype}")
     print(f"  测试集: {args.testset_path}")
     print(f"  输出目录: {args.output_dir}")
     print(f"  生成baseline: {args.generate_baseline}")

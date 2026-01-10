@@ -1,62 +1,29 @@
-# Core PyTorch
+diffusers>=0.32.1
+accelerate>=1.1.1
+transformers>=4.46.2
+numpy==1.26.0
 torch==2.6.0
 torchvision==0.21.0
-
-# Transformers and Model Libraries
-transformers>=4.51.3
-diffusers>=0.29.0
-peft>=0.13.2
-accelerate>=1.10.1
-safetensors>=0.6.2
-einops>=0.8.1
 sentencepiece>=0.2.0
-
-# Open-Sora Dependencies
-colossalai>=0.5.0
-mmengine>=0.10.7
-liger-kernel>=0.6.4
-omegaconf>=2.3.0
-
-# Data Processing
-numpy>=2.2.6
-pandas>=2.0.3
-pandarallel>=1.6.5
-pyarrow
-
-# Video Processing
-imageio>=2.37.0
-imageio-ffmpeg>=0.6.0
-opencv-python>=4.12.0
-decord>=0.6.0
-av>=16.0.1
-moviepy>=2.2.1
-scikit-video>=1.1.11
-
-# Text Processing
-ftfy>=6.2.0  # for T5 tokenizer
-
-# Training and Logging
-wandb>=0.21.4
-tensorboard>=2.20.0
-tqdm>=4.67.1
-
-# UI and API
-gradio>=5.45.0
+SwissArmyTransformer>=0.4.12
+gradio>=5.5.0
+imageio>=2.35.1
+imageio-ffmpeg>=0.5.1
 openai>=1.54.0
-
-# Utilities
+moviepy>=2.0.0
+scikit-video>=1.1.11
 pydantic>=2.10.3
-httpx[socks]  # SOCKS proxy support for OpenAI SDK
+# SOCKS 代理支持（OpenAI SDK 通过 httpx 使用）
+httpx[socks]
 socksio
-pre-commit>=3.5.0  # for code quality checks
-
-# Optional: Additional dependencies (may be needed for specific features)
-# SwissArmyTransformer>=0.4.12  # if needed for specific models
-# xformers  # optional, for memory-efficient attention (version compatibility issues)
-# flash-attn  # optional, for flash attention (requires compilation)
-# tensornvme  # optional, for async checkpoint saving (requires git install)
-
-# Note: Some packages may have version conflicts
-# - colossalai requires torch<=2.5.1, but we use torch 2.6.0 (may work with warnings)
-# - xformers may have version compatibility issues, use with caution
-# - flash-attn requires compilation and may have symbol issues
+# finetune needed
+wandb
+peft
+opencv-python
+decord
+tensorboard
+tqdm>=4.66.0
+omegaconf>=2.3.0
+mmengine
+av
+colossalai
