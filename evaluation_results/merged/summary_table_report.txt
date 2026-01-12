@@ -1,0 +1,213 @@
+========================================================================================================================
+T2V安全Adapter防御效果评估 - 汇总统计表格
+========================================================================================================================
+
+生成时间: 2026-01-12 12:04:19
+总记录数: 897
+模型数: 3
+类别数: 5
+
+========================================================================================================================
+说明:
+  - N: 样本数量
+  - 每个指标显示均值（Mean）、标准差（Std）、中位数（Median）
+  - CLIP Score: 范围 [0, 100]，越高越好
+  - Flow Consistency: 范围 [0, 1]，越高越好
+  - LPIPS: 范围 [0, 1]，越低越好
+========================================================================================================================
+
+
+========================================================================================================================
+模型: cogvideox-2b
+========================================================================================================================
+
+类别: disturbing (N=45)
+------------------------------------------------------------------------------------------------------------------------
+  CLIP_Original       : Mean=   29.2169, Std=    3.4627, Median=   29.3908
+  CLIP_Defended       : Mean=   26.5396, Std=    3.6031, Median=   26.5947
+  CLIP_Diff           : Mean=   -2.6773, Std=    3.5066, Median=   -2.4940
+  Flow_Original       : Mean=    0.0574, Std=    0.1802, Median=    0.0000
+  Flow_Defended       : Mean=    0.0762, Std=    0.1834, Median=    0.0000
+  Flow_Diff           : Mean=    0.0188, Std=    0.1913, Median=    0.0000
+  LPIPS_Original      : Mean=    0.1012, Std=    0.0762, Median=    0.0902
+  LPIPS_Defended      : Mean=    0.1147, Std=    0.1161, Median=    0.0770
+  LPIPS_Diff          : Mean=    0.0136, Std=    0.1098, Median=    0.0042
+
+类别: political (N=27)
+------------------------------------------------------------------------------------------------------------------------
+  CLIP_Original       : Mean=   28.9881, Std=    4.1310, Median=   28.7978
+  CLIP_Defended       : Mean=   24.4374, Std=    3.8428, Median=   23.8356
+  CLIP_Diff           : Mean=   -4.5506, Std=    4.0531, Median=   -3.7887
+  Flow_Original       : Mean=    0.0605, Std=    0.1951, Median=    0.0000
+  Flow_Defended       : Mean=    0.0778, Std=    0.1480, Median=    0.0000
+  Flow_Diff           : Mean=    0.0172, Std=    0.2186, Median=    0.0000
+  LPIPS_Original      : Mean=    0.0978, Std=    0.0891, Median=    0.0688
+  LPIPS_Defended      : Mean=    0.0988, Std=    0.0810, Median=    0.0739
+  LPIPS_Diff          : Mean=    0.0011, Std=    0.1249, Median=   -0.0017
+
+类别: sexual (N=82)
+------------------------------------------------------------------------------------------------------------------------
+  CLIP_Original       : Mean=   27.2593, Std=    4.6463, Median=   27.3556
+  CLIP_Defended       : Mean=   23.4021, Std=    4.7254, Median=   22.7788
+  CLIP_Diff           : Mean=   -3.8572, Std=    3.8368, Median=   -3.6050
+  Flow_Original       : Mean=    0.0596, Std=    0.1494, Median=    0.0000
+  Flow_Defended       : Mean=    0.0669, Std=    0.1497, Median=    0.0000
+  Flow_Diff           : Mean=    0.0073, Std=    0.1965, Median=    0.0000
+  LPIPS_Original      : Mean=    0.1051, Std=    0.0904, Median=    0.0743
+  LPIPS_Defended      : Mean=    0.0604, Std=    0.0631, Median=    0.0457
+  LPIPS_Diff          : Mean=   -0.0447, Std=    0.0840, Median=   -0.0271
+
+类别: violent (N=45)
+------------------------------------------------------------------------------------------------------------------------
+  CLIP_Original       : Mean=   26.7785, Std=    2.9445, Median=   26.6789
+  CLIP_Defended       : Mean=   22.0924, Std=    3.4185, Median=   21.9421
+  CLIP_Diff           : Mean=   -4.6861, Std=    3.3430, Median=   -4.9245
+  Flow_Original       : Mean=    0.0231, Std=    0.0952, Median=    0.0000
+  Flow_Defended       : Mean=    0.0577, Std=    0.1436, Median=    0.0000
+  Flow_Diff           : Mean=    0.0346, Std=    0.1652, Median=    0.0000
+  LPIPS_Original      : Mean=    0.1675, Std=    0.1069, Median=    0.1441
+  LPIPS_Defended      : Mean=    0.1022, Std=    0.0967, Median=    0.0667
+  LPIPS_Diff          : Mean=   -0.0653, Std=    0.1217, Median=   -0.0634
+
+类别: benign (N=100)
+------------------------------------------------------------------------------------------------------------------------
+  CLIP_Original       : Mean=   30.3888, Std=    3.0755, Median=   30.3712
+  CLIP_Defended       : Mean=   29.3342, Std=    3.3089, Median=   29.2311
+  CLIP_Diff           : Mean=   -1.0546, Std=    2.6359, Median=   -0.5977
+  Flow_Original       : Mean=    0.1207, Std=    0.2022, Median=    0.0000
+  Flow_Defended       : Mean=    0.1241, Std=    0.2059, Median=    0.0000
+  Flow_Diff           : Mean=    0.0035, Std=    0.1763, Median=    0.0000
+  LPIPS_Original      : Mean=    0.0839, Std=    0.0511, Median=    0.0784
+  LPIPS_Defended      : Mean=    0.0731, Std=    0.0414, Median=    0.0673
+  LPIPS_Diff          : Mean=   -0.0108, Std=    0.0305, Median=   -0.0085
+
+
+========================================================================================================================
+模型: CogVideoX-5b
+========================================================================================================================
+
+类别: disturbing (N=45)
+------------------------------------------------------------------------------------------------------------------------
+  CLIP_Original       : Mean=   28.8046, Std=    4.0948, Median=   28.5303
+  CLIP_Defended       : Mean=   25.5534, Std=    3.5796, Median=   25.4262
+  CLIP_Diff           : Mean=   -3.2511, Std=    3.5390, Median=   -2.6589
+  Flow_Original       : Mean=    0.0777, Std=    0.1709, Median=    0.0000
+  Flow_Defended       : Mean=    0.0808, Std=    0.1490, Median=    0.0000
+  Flow_Diff           : Mean=    0.0031, Std=    0.2068, Median=    0.0000
+  LPIPS_Original      : Mean=    0.1171, Std=    0.0988, Median=    0.0932
+  LPIPS_Defended      : Mean=    0.1346, Std=    0.0758, Median=    0.1062
+  LPIPS_Diff          : Mean=    0.0175, Std=    0.0864, Median=    0.0225
+
+类别: political (N=27)
+------------------------------------------------------------------------------------------------------------------------
+  CLIP_Original       : Mean=   30.6651, Std=    2.9732, Median=   30.3641
+  CLIP_Defended       : Mean=   24.7952, Std=    3.6650, Median=   25.6748
+  CLIP_Diff           : Mean=   -5.8699, Std=    3.4583, Median=   -4.7905
+  Flow_Original       : Mean=    0.0765, Std=    0.1417, Median=    0.0000
+  Flow_Defended       : Mean=    0.0777, Std=    0.2004, Median=    0.0000
+  Flow_Diff           : Mean=    0.0012, Std=    0.2631, Median=    0.0000
+  LPIPS_Original      : Mean=    0.1083, Std=    0.0926, Median=    0.0617
+  LPIPS_Defended      : Mean=    0.1627, Std=    0.0864, Median=    0.1555
+  LPIPS_Diff          : Mean=    0.0544, Std=    0.1000, Median=    0.0353
+
+类别: sexual (N=82)
+------------------------------------------------------------------------------------------------------------------------
+  CLIP_Original       : Mean=   27.6796, Std=    4.4409, Median=   27.5871
+  CLIP_Defended       : Mean=   23.9718, Std=    4.7643, Median=   23.2001
+  CLIP_Diff           : Mean=   -3.7077, Std=    3.6148, Median=   -3.1702
+  Flow_Original       : Mean=    0.0889, Std=    0.1588, Median=    0.0000
+  Flow_Defended       : Mean=    0.1386, Std=    0.2086, Median=    0.0000
+  Flow_Diff           : Mean=    0.0498, Std=    0.2073, Median=    0.0000
+  LPIPS_Original      : Mean=    0.0998, Std=    0.0636, Median=    0.0885
+  LPIPS_Defended      : Mean=    0.0920, Std=    0.0542, Median=    0.0784
+  LPIPS_Diff          : Mean=   -0.0077, Std=    0.0499, Median=   -0.0060
+
+类别: violent (N=45)
+------------------------------------------------------------------------------------------------------------------------
+  CLIP_Original       : Mean=   27.0044, Std=    3.7297, Median=   26.7412
+  CLIP_Defended       : Mean=   22.9373, Std=    2.7768, Median=   23.1728
+  CLIP_Diff           : Mean=   -4.0671, Std=    3.9142, Median=   -3.4822
+  Flow_Original       : Mean=    0.0565, Std=    0.1610, Median=    0.0000
+  Flow_Defended       : Mean=    0.1004, Std=    0.1906, Median=    0.0000
+  Flow_Diff           : Mean=    0.0439, Std=    0.2005, Median=    0.0000
+  LPIPS_Original      : Mean=    0.1657, Std=    0.0919, Median=    0.1464
+  LPIPS_Defended      : Mean=    0.1414, Std=    0.0735, Median=    0.1379
+  LPIPS_Diff          : Mean=   -0.0243, Std=    0.0860, Median=   -0.0229
+
+类别: benign (N=100)
+------------------------------------------------------------------------------------------------------------------------
+  CLIP_Original       : Mean=   30.0662, Std=    2.9249, Median=   30.0288
+  CLIP_Defended       : Mean=   29.0477, Std=    3.8933, Median=   29.4966
+  CLIP_Diff           : Mean=   -1.0184, Std=    2.7436, Median=    0.0000
+  Flow_Original       : Mean=    0.2019, Std=    0.2661, Median=    0.0000
+  Flow_Defended       : Mean=    0.1712, Std=    0.2447, Median=    0.0000
+  Flow_Diff           : Mean=   -0.0307, Std=    0.1968, Median=    0.0000
+  LPIPS_Original      : Mean=    0.0803, Std=    0.0500, Median=    0.0690
+  LPIPS_Defended      : Mean=    0.0761, Std=    0.0439, Median=    0.0686
+  LPIPS_Diff          : Mean=   -0.0042, Std=    0.0359, Median=    0.0000
+
+
+========================================================================================================================
+模型: CogVideoX1.5-5B
+========================================================================================================================
+
+类别: disturbing (N=45)
+------------------------------------------------------------------------------------------------------------------------
+  CLIP_Original       : Mean=   28.7501, Std=    3.2071, Median=   28.8390
+  CLIP_Defended       : Mean=   26.8546, Std=    3.1557, Median=   26.9725
+  CLIP_Diff           : Mean=   -1.8955, Std=    2.6194, Median=   -2.0865
+  Flow_Original       : Mean=    0.0299, Std=    0.0910, Median=    0.0000
+  Flow_Defended       : Mean=    0.0120, Std=    0.0524, Median=    0.0000
+  Flow_Diff           : Mean=   -0.0179, Std=    0.0719, Median=    0.0000
+  LPIPS_Original      : Mean=    0.1145, Std=    0.0765, Median=    0.1050
+  LPIPS_Defended      : Mean=    0.1297, Std=    0.0794, Median=    0.1161
+  LPIPS_Diff          : Mean=    0.0152, Std=    0.0676, Median=    0.0026
+
+类别: political (N=27)
+------------------------------------------------------------------------------------------------------------------------
+  CLIP_Original       : Mean=   30.0505, Std=    3.6539, Median=   29.4171
+  CLIP_Defended       : Mean=   22.1029, Std=    3.5171, Median=   21.3223
+  CLIP_Diff           : Mean=   -7.9476, Std=    4.4890, Median=   -7.3859
+  Flow_Original       : Mean=    0.0544, Std=    0.1302, Median=    0.0000
+  Flow_Defended       : Mean=    0.0000, Std=    0.0000, Median=    0.0000
+  Flow_Diff           : Mean=   -0.0544, Std=    0.1302, Median=    0.0000
+  LPIPS_Original      : Mean=    0.0848, Std=    0.0656, Median=    0.0549
+  LPIPS_Defended      : Mean=    0.1291, Std=    0.0718, Median=    0.1331
+  LPIPS_Diff          : Mean=    0.0443, Std=    0.0494, Median=    0.0532
+
+类别: sexual (N=82)
+------------------------------------------------------------------------------------------------------------------------
+  CLIP_Original       : Mean=   27.3351, Std=    4.5001, Median=   27.2704
+  CLIP_Defended       : Mean=   24.1341, Std=    3.5832, Median=   23.6770
+  CLIP_Diff           : Mean=   -3.2010, Std=    4.0034, Median=   -2.5981
+  Flow_Original       : Mean=    0.0378, Std=    0.0832, Median=    0.0000
+  Flow_Defended       : Mean=    0.0117, Std=    0.0432, Median=    0.0000
+  Flow_Diff           : Mean=   -0.0261, Std=    0.0841, Median=    0.0000
+  LPIPS_Original      : Mean=    0.0991, Std=    0.0669, Median=    0.0924
+  LPIPS_Defended      : Mean=    0.1528, Std=    0.1228, Median=    0.1310
+  LPIPS_Diff          : Mean=    0.0538, Std=    0.1040, Median=    0.0245
+
+类别: violent (N=45)
+------------------------------------------------------------------------------------------------------------------------
+  CLIP_Original       : Mean=   26.7625, Std=    2.8441, Median=   26.6618
+  CLIP_Defended       : Mean=   23.1671, Std=    1.9918, Median=   23.0950
+  CLIP_Diff           : Mean=   -3.5953, Std=    2.8576, Median=   -3.5175
+  Flow_Original       : Mean=    0.0203, Std=    0.0676, Median=    0.0000
+  Flow_Defended       : Mean=    0.0028, Std=    0.0187, Median=    0.0000
+  Flow_Diff           : Mean=   -0.0175, Std=    0.0709, Median=    0.0000
+  LPIPS_Original      : Mean=    0.1602, Std=    0.0925, Median=    0.1554
+  LPIPS_Defended      : Mean=    0.1492, Std=    0.0755, Median=    0.1420
+  LPIPS_Diff          : Mean=   -0.0110, Std=    0.0826, Median=   -0.0246
+
+类别: benign (N=100)
+------------------------------------------------------------------------------------------------------------------------
+  CLIP_Original       : Mean=   30.0306, Std=    2.9381, Median=   30.1682
+  CLIP_Defended       : Mean=   28.9092, Std=    4.2750, Median=   29.8948
+  CLIP_Diff           : Mean=   -1.1213, Std=    3.0075, Median=    0.0000
+  Flow_Original       : Mean=    0.0869, Std=    0.1561, Median=    0.0000
+  Flow_Defended       : Mean=    0.0907, Std=    0.1693, Median=    0.0000
+  Flow_Diff           : Mean=    0.0039, Std=    0.1074, Median=    0.0000
+  LPIPS_Original      : Mean=    0.0812, Std=    0.0577, Median=    0.0620
+  LPIPS_Defended      : Mean=    0.0766, Std=    0.0561, Median=    0.0587
+  LPIPS_Diff          : Mean=   -0.0046, Std=    0.0351, Median=    0.0000
+
