@@ -32,6 +32,11 @@ import argparse
 from dataclasses import dataclass
 from typing import Dict, List, Tuple, Optional
 
+# 修复 PyTorch 与 Intel MKL 的符号冲突问题
+# 必须在导入 torch 之前设置
+os.environ.setdefault('MKL_SERVICE_FORCE_INTEL', '1')
+os.environ.setdefault('KMP_DUPLICATE_LIB_OK', 'TRUE')
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -256,15 +261,20 @@ def load_opensora_components(opensora_repo: str, ckpt: str, device: torch.device
     te_dir = os.path.join(ckpt, "text_encoder")
 
     try:
+        # 确定数据类型（优先使用 bfloat16，如果不支持则使用 float16）
+        dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+        
         if os.path.isdir(tok_dir) and os.path.isdir(te_dir):
             print(f"[Open-Sora] 使用 diffusers 风格子目录加载 T5：{ckpt}")
             tokenizer = T5Tokenizer.from_pretrained(tok_dir, legacy=True)
-            text_encoder = T5EncoderModel.from_pretrained(te_dir)
+            # 使用半精度加载以节省内存
+            text_encoder = T5EncoderModel.from_pretrained(te_dir, torch_dtype=dtype)
         else:
             # 情况2：直接作为模型ID或单一目录
             print(f"[Open-Sora] 使用 HuggingFace 模型或本地目录加载 T5：{ckpt}")
             tokenizer = T5Tokenizer.from_pretrained(ckpt, legacy=True)
-            text_encoder = T5EncoderModel.from_pretrained(ckpt)
+            # 使用半精度加载以节省内存
+            text_encoder = T5EncoderModel.from_pretrained(ckpt, torch_dtype=dtype)
     except Exception as e:
         raise RuntimeError(
             f"[Open-Sora] 无法从 '{ckpt}' 加载 T5 tokenizer/text_encoder，"
@@ -273,7 +283,13 @@ def load_opensora_components(opensora_repo: str, ckpt: str, device: torch.device
 
     text_encoder = text_encoder.to(device)
     text_encoder.eval()
-    print(f"[Open-Sora] T5加载完成")
+    
+    # 清理缓存
+    torch.cuda.empty_cache()
+    import gc
+    gc.collect()
+    
+    print(f"[Open-Sora] T5加载完成 (dtype: {dtype})")
 
     # 如果需要加载完整模型（推理时）
     model = None
@@ -293,6 +309,15 @@ def load_opensora_components(opensora_repo: str, ckpt: str, device: torch.device
                 from mmengine.config import Config
                 from opensora.registry import MODELS, build_module
                 from opensora.utils.sampling import prepare_models
+                
+                # 内存优化：临时将 T5 移到 CPU 以释放 GPU 内存
+                print(f"[Open-Sora] 临时将 T5 移到 CPU 以释放 GPU 内存...")
+                text_encoder_cpu = text_encoder.cpu()
+                del text_encoder
+                torch.cuda.empty_cache()
+                import gc
+                gc.collect()
+                torch.cuda.empty_cache()
                 
                 # 创建配置（使用默认配置）
                 # 模型权重路径
@@ -346,6 +371,8 @@ def load_opensora_components(opensora_repo: str, ckpt: str, device: torch.device
                 
                 # 清理GPU缓存
                 torch.cuda.empty_cache()
+                gc.collect()
+                torch.cuda.empty_cache()
                 
                 # 使用Open-Sora的prepare_models加载
                 # offload_model=True 会将模型加载到CPU，推理时再移到GPU
@@ -363,17 +390,32 @@ def load_opensora_components(opensora_repo: str, ckpt: str, device: torch.device
                 
                 # 清理缓存
                 torch.cuda.empty_cache()
+                gc.collect()
+                torch.cuda.empty_cache()
+                
+                # 将 T5 移回 GPU（如果需要）
+                print(f"[Open-Sora] 将 T5 移回 GPU...")
+                text_encoder = text_encoder_cpu.to(device)
+                del text_encoder_cpu
+                torch.cuda.empty_cache()
                 
                 print(f"[Open-Sora] ✅ 完整模型加载成功")
                 print(f"  - DiT模型: {type(model)}")
                 print(f"  - VAE模型: {type(model_ae)}")
                 print(f"  - CLIP模型: {type(model_clip)}")
+                print(f"  - T5模型: {type(text_encoder)}")
                 
         except Exception as e:
             import traceback
             print(f"[Open-Sora] ❌ 加载完整模型失败: {e}")
             print(f"[Open-Sora] 错误详情:")
             traceback.print_exc()
+            # 如果加载失败，确保 text_encoder 仍然可用（移回 GPU）
+            if 'text_encoder_cpu' in locals():
+                print(f"[Open-Sora] 恢复 T5 到 GPU...")
+                text_encoder = text_encoder_cpu.to(device)
+                del text_encoder_cpu
+                torch.cuda.empty_cache()
             raise
 
     return {

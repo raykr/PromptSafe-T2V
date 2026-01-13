@@ -114,7 +114,22 @@ if [ "$USE_MULTI_GPU" = "1" ]; then
   echo "⚠️  启用多GPU推理（使用DataParallel）"
 fi
 
-CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES python opensora_safe_adapter.py "${CMD_ARGS[@]}"
+# 修复 PyTorch 与 Intel MKL 的符号冲突问题
+export MKL_SERVICE_FORCE_INTEL=1
+export KMP_DUPLICATE_LIB_OK=TRUE
+
+# 尝试预加载 Intel OpenMP 库（如果存在）
+if [ -n "$CONDA_PREFIX" ] && [ -f "$CONDA_PREFIX/lib/libiomp5.so" ]; then
+  export LD_PRELOAD="$CONDA_PREFIX/lib/libiomp5.so:$LD_PRELOAD"
+fi
+
+# 禁用 Intel JIT（可能导致符号缺失）
+export MKL_INTERFACE_LAYER=LP64,GNU
+
+# PyTorch 内存优化
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
+CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES python ../opensora_safe_adapter.py "${CMD_ARGS[@]}"
 
 echo ""
 echo "=========================================="
